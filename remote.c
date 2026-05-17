@@ -572,13 +572,13 @@ remote_spawn_sessions(struct remote_host *rh)
 			if (first_win) {
 				xasprintf(&cmd,
 				    "new-session -d -s '%s' -n '%s' -x 80 -y 24 "
-				    "'exec sleep infinity'",
+				    "'exec cat > /dev/null'",
 				    sname, rw->name);
 				first_win = 0;
 			} else {
 				xasprintf(&cmd,
 				    "new-window -d -t '%s:' -n '%s' "
-				    "'exec sleep infinity'",
+				    "'exec cat > /dev/null'",
 				    sname, rw->name);
 			}
 
