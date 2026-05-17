@@ -603,11 +603,20 @@ remote_spawn_sessions(struct remote_host *rh)
 		 * Set session options:
 		 * - remain-on-exit: panes stay if sleep is killed
 		 * - detach-on-destroy: switch to another session
+		 * - default-command: new windows get placeholder process
+		 *   (remote-new-pane hook will wire them up)
 		 */
 		xasprintf(&cmd,
 		    "set-option -t '%s' remain-on-exit on \\; "
-		    "set-option -t '%s' detach-on-destroy no-detached",
-		    sname, sname);
+		    "set-option -t '%s' detach-on-destroy no-detached \\; "
+		    "set-option -t '%s' default-command 'exec cat > /dev/null' \\; "
+		    "set-hook -t '%s' after-new-window "
+		    "'run-shell \"tmux remote-new-pane %s\"' \\; "
+		    "set-hook -t '%s' after-split-window "
+		    "'run-shell \"tmux remote-new-pane %s\"'",
+		    sname, sname, sname,
+		    sname, rh->name,
+		    sname, rh->name);
 		state = cmdq_new_state(NULL, NULL, 0);
 		cmd_parse_and_append(cmd, NULL, NULL, state, &error);
 		cmdq_free_state(state);

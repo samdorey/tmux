@@ -39,6 +39,21 @@ static enum cmd_retval	cmd_remote_list_exec(struct cmd *, struct cmdq_item *);
 static enum cmd_retval	cmd_remote_refresh_exec(struct cmd *,
 			    struct cmdq_item *);
 static enum cmd_retval	cmd_remote_open_exec(struct cmd *, struct cmdq_item *);
+static enum cmd_retval	cmd_remote_new_pane_exec(struct cmd *,
+			    struct cmdq_item *);
+
+const struct cmd_entry cmd_remote_new_pane_entry = {
+	.name = "remote-new-pane",
+	.alias = NULL,
+
+	.args = { "", 1, 1, NULL },
+	.usage = "remote-name",
+
+	.target = { .flags = CMD_FIND_PANE },
+
+	.flags = CMD_AFTERHOOK,
+	.exec = cmd_remote_new_pane_exec
+};
 
 const struct cmd_entry cmd_remote_add_entry = {
 	.name = "remote-add",
@@ -255,5 +270,71 @@ cmd_remote_open_exec(struct cmd *self, struct cmdq_item *item)
 
 	remote_open(rh, target, item);
 	free(name);
+	return (CMD_RETURN_NORMAL);
+}
+
+static enum cmd_retval
+cmd_remote_new_pane_exec(struct cmd *self, struct cmdq_item *item)
+{
+	struct args		*args = cmd_get_args(self);
+	const char		*name;
+	struct remote_host	*rh;
+	struct cmd_find_state	*target;
+	struct window_pane	*wp;
+	struct session		*s;
+	struct bufferevent	*bev;
+	char			 cmd[256];
+	char			*rs_name;
+	const char		*slash;
+
+	name = args_string(args, 0);
+	rh = remote_find(name);
+	if (rh == NULL) {
+		cmdq_error(item, "remote not found: %s", name);
+		return (CMD_RETURN_ERROR);
+	}
+	if (rh->state != REMOTE_READY || rh->job == NULL) {
+		cmdq_error(item, "remote not connected: %s", name);
+		return (CMD_RETURN_ERROR);
+	}
+
+	target = cmdq_get_target(item);
+	wp = target->wp;
+	s = target->s;
+
+	if (wp == NULL || s == NULL)
+		return (CMD_RETURN_ERROR);
+
+	/*
+	 * Extract the remote session name from the local session name.
+	 * Local session is "hostname/remotesession", we need "remotesession".
+	 */
+	slash = strchr(s->name, '/');
+	if (slash != NULL)
+		rs_name = xstrdup(slash + 1);
+	else
+		rs_name = xstrdup(s->name);
+
+	/* Create a new window on the remote. */
+	bev = job_get_event(rh->job);
+	if (bev != NULL) {
+		snprintf(cmd, sizeof cmd, "new-window -t '%s'\n", rs_name);
+		bufferevent_write(bev, cmd, strlen(cmd));
+	}
+
+	/* Mark this local pane as a remote proxy. */
+	wp->flags |= PANE_REMOTE;
+	wp->remote = rh;
+	/*
+	 * We don't know the new remote pane ID yet (it will come via
+	 * %window-add notification). For now, set it to the session's
+	 * first pane. A refresh will correct the mapping.
+	 */
+	wp->remote_pane = 0;
+
+	/* Trigger a refresh to re-map pane IDs. */
+	remote_refresh(rh);
+
+	free(rs_name);
 	return (CMD_RETURN_NORMAL);
 }
