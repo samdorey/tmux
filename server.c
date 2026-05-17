@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
+#include "remote.h"
 
 /*
  * Main server functions.
@@ -214,6 +215,7 @@ server_start(struct tmuxproc *client, uint64_t flags, struct event_base *base,
 	TAILQ_INIT(&clients);
 	RB_INIT(&sessions);
 	key_bindings_init();
+	remote_init();
 	TAILQ_INIT(&message_log);
 	gettimeofday(&start_time, NULL);
 

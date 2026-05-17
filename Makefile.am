@@ -125,6 +125,7 @@ dist_tmux_SOURCES = \
 	cmd-pipe-pane.c \
 	cmd-queue.c \
 	cmd-refresh-client.c \
+	cmd-remote.c \
 	cmd-rename-session.c \
 	cmd-rename-window.c \
 	cmd-resize-pane.c \
@@ -185,6 +186,8 @@ dist_tmux_SOURCES = \
 	popup.c \
 	proc.c \
 	regsub.c \
+	remote.c \
+	remote.h \
 	resize.c \
 	screen-redraw.c \
 	screen-write.c \

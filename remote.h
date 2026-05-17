@@ -1,0 +1,95 @@
+/* $OpenBSD$ */
+
+/*
+ * Copyright (c) 2026 Sam Dorey
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF MIND, USE, DATA OR PROFITS, WHETHER
+ * IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING
+ * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+#ifndef REMOTE_H
+#define REMOTE_H
+
+#include "tmux.h"
+
+/* Remote host connection states. */
+enum remote_state {
+	REMOTE_DISCONNECTED,
+	REMOTE_CONNECTING,
+	REMOTE_READY,
+	REMOTE_FAILED
+};
+
+/* A cached pane from the remote tmux. */
+struct remote_pane {
+	u_int				 id;
+	char				*title;
+	int				 active;
+	TAILQ_ENTRY(remote_pane)	 entry;
+};
+TAILQ_HEAD(remote_panes, remote_pane);
+
+/* A cached window from the remote tmux. */
+struct remote_window {
+	u_int				 id;
+	int				 idx;
+	char				*name;
+	int				 active;
+	struct remote_panes		 panes;
+	TAILQ_ENTRY(remote_window)	 entry;
+};
+TAILQ_HEAD(remote_windows, remote_window);
+
+/* A cached session from the remote tmux. */
+struct remote_session {
+	u_int				 id;
+	char				*name;
+	int				 attached;
+	struct remote_windows		 windows;
+	TAILQ_ENTRY(remote_session)	 entry;
+};
+TAILQ_HEAD(remote_sessions, remote_session);
+
+/* A remote host definition. */
+struct remote_host {
+	char				*name;
+	char				*ssh_target;
+	char				*tmux_target;	/* optional -t arg */
+
+	enum remote_state		 state;
+	char				*error;
+
+	struct job			*job;
+	struct evbuffer			*pending;	/* partial line buf */
+	struct remote_sessions		 sessions;
+
+	TAILQ_ENTRY(remote_host)	 entry;
+};
+TAILQ_HEAD(remote_hosts, remote_host);
+
+/* Global list of remotes. */
+extern struct remote_hosts remote_hosts;
+
+/* remote.c */
+void			 remote_init(void);
+void			 remote_destroy(void);
+struct remote_host	*remote_add(const char *, const char *, const char *);
+void			 remote_remove(struct remote_host *);
+struct remote_host	*remote_find(const char *);
+void			 remote_connect(struct remote_host *);
+void			 remote_disconnect(struct remote_host *);
+void			 remote_refresh(struct remote_host *);
+void			 remote_clear_tree(struct remote_host *);
+void			 remote_open(struct remote_host *, const char *,
+			     struct cmdq_item *);
+
+#endif /* REMOTE_H */
