@@ -644,7 +644,6 @@ remote_mark_panes_cb(__unused struct cmdq_item *item, void *data)
 	struct winlink		*wl;
 	struct window_pane	*wp;
 	char			*sname;
-	int			 widx;
 
 	TAILQ_FOREACH(rs, &rh->sessions, entry) {
 		xasprintf(&sname, "%s/%s", rh->name, rs->name);
@@ -653,20 +652,19 @@ remote_mark_panes_cb(__unused struct cmdq_item *item, void *data)
 		if (s == NULL)
 			continue;
 
-		widx = 0;
+		/*
+		 * Match remote windows to local windows by iterating both
+		 * lists in order. We created local windows in the same
+		 * order as remote windows.
+		 */
+		wl = RB_MIN(winlinks, &s->windows);
 		TAILQ_FOREACH(rw, &rs->windows, entry) {
 			rp = TAILQ_FIRST(&rw->panes);
 			if (rp == NULL)
 				continue;
+			if (wl == NULL)
+				break;
 
-			/* Find the local window by index. */
-			wl = winlink_find_by_index(&s->windows, widx);
-			if (wl == NULL) {
-				widx++;
-				continue;
-			}
-
-			/* Mark the first pane as remote proxy. */
 			wp = wl->window->active;
 			if (wp != NULL) {
 				wp->flags |= PANE_REMOTE;
@@ -674,8 +672,27 @@ remote_mark_panes_cb(__unused struct cmdq_item *item, void *data)
 				wp->remote_pane = rp->id;
 				log_debug("remote: marked %%%u -> remote %%%u",
 				    wp->id, rp->id);
+
+				/*
+				 * Request initial screen content. Send a
+				 * no-op to the remote pane to trigger %output
+				 * with the current prompt/screen.
+				 */
+				{
+					struct bufferevent *bev;
+					char refresh[64];
+
+					bev = job_get_event(rh->job);
+					if (bev != NULL) {
+						snprintf(refresh, sizeof refresh,
+						    "send-keys -t %%%u ''\n",
+						    rp->id);
+						bufferevent_write(bev, refresh,
+						    strlen(refresh));
+					}
+				}
 			}
-			widx++;
+			wl = RB_NEXT(winlinks, &s->windows, wl);
 		}
 	}
 	return (CMD_RETURN_NORMAL);
