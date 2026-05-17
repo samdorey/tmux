@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
+#include "remote.h"
 
 /*
  * Set up the environment and create a new window and pane or a new pane.
@@ -369,6 +370,46 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		new_wp->flags |= PANE_EMPTY;
 		new_wp->base.mode &= ~MODE_CURSOR;
 		new_wp->base.mode |= MODE_CRLF;
+		goto complete;
+	}
+
+	/*
+	 * If this is a remote session, fork a placeholder process and
+	 * set up the pane as a remote proxy. All I/O will go through
+	 * the control mode connection instead of the child process.
+	 */
+	if (s->remote != NULL) {
+		new_wp->pid = fdforkpty(ptm_fd, &new_wp->fd, new_wp->tty,
+		    NULL, &ws);
+		if (new_wp->pid == -1) {
+			xasprintf(cause, "fork failed: %s", strerror(errno));
+			new_wp->fd = -1;
+			if (~sc->flags & SPAWN_RESPAWN) {
+				server_client_remove_pane(new_wp);
+				layout_close_pane(new_wp);
+				window_remove_pane(w, new_wp);
+			}
+			sigprocmask(SIG_SETMASK, &oldset, NULL);
+			environ_free(child);
+			return (NULL);
+		}
+		if (new_wp->pid == 0) {
+			/* Child: placeholder that blocks forever. */
+			closefrom(STDERR_FILENO + 1);
+			execl("/bin/sh", "sh", "-c",
+			    "exec cat > /dev/null", (char *)NULL);
+			_exit(1);
+		}
+		/* Parent: mark as remote proxy. */
+		new_wp->flags |= PANE_REMOTE;
+		new_wp->remote = s->remote;
+		new_wp->remote_pane = 0; /* mapped later by refresh */
+		log_debug("spawn: remote proxy pane %%%u for %s",
+		    new_wp->id, s->remote->name);
+
+		/* Tell the remote to create a new window. */
+		remote_create_window(s->remote, s->remote_session);
+
 		goto complete;
 	}
 

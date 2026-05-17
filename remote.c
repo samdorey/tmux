@@ -38,6 +38,8 @@ static void		remote_spawn_sessions(struct remote_host *);
 static void		remote_destroy_sessions(struct remote_host *);
 static size_t		remote_decode_output(const char *, u_char *, size_t);
 static enum cmd_retval	remote_mark_panes_cb(struct cmdq_item *, void *);
+static void		remote_set_session_remote(struct session *,
+			    struct remote_host *, const char *);
 
 void
 remote_init(void)
@@ -531,13 +533,16 @@ found:
 }
 
 /*
- * Create local proxy pane sessions mirroring the remote tree.
+ * Create local sessions mirroring the remote tree.
  *
- * For each remote session, create a local session. For each remote window,
- * create a local window. Each pane runs "sleep infinity" as a placeholder
- * process; actual I/O is proxied through the control mode connection.
- * The PANE_REMOTE flag on each pane routes keystrokes to the remote and
- * %output notifications inject data into the local terminal emulator.
+ * Sessions are created via queued commands. Once created, the
+ * remote_mark_panes_cb callback marks the session as remote, which
+ * causes spawn_pane() to automatically create proxy panes for any
+ * new windows/panes in that session (including the initial one).
+ *
+ * However, since the initial pane is created by new-session before
+ * we can mark the session as remote, we use the callback to also
+ * retroactively mark existing panes.
  */
 static void
 remote_spawn_sessions(struct remote_host *rh)
@@ -560,25 +565,18 @@ remote_spawn_sessions(struct remote_host *rh)
 
 		first_win = 1;
 		TAILQ_FOREACH(rw, &rs->windows, entry) {
-			/*
-			 * For V1, create one pane per window using the first
-			 * (active) pane. Multi-pane windows will be handled
-			 * in a future version.
-			 */
 			rp = TAILQ_FIRST(&rw->panes);
 			if (rp == NULL)
 				continue;
 
 			if (first_win) {
 				xasprintf(&cmd,
-				    "new-session -d -s '%s' -n '%s' -x 80 -y 24 "
-				    "'exec cat > /dev/null'",
+				    "new-session -d -s '%s' -n '%s' -x 80 -y 24",
 				    sname, rw->name);
 				first_win = 0;
 			} else {
 				xasprintf(&cmd,
-				    "new-window -d -t '%s:' -n '%s' "
-				    "'exec cat > /dev/null'",
+				    "new-window -d -t '%s:' -n '%s'",
 				    sname, rw->name);
 			}
 
@@ -594,43 +592,27 @@ remote_spawn_sessions(struct remote_host *rh)
 		}
 
 		if (first_win) {
-			/* No windows — shouldn't happen. */
 			free(sname);
 			continue;
 		}
 
 		/*
-		 * Set session options:
-		 * - remain-on-exit: panes stay if sleep is killed
-		 * - detach-on-destroy: switch to another session
-		 * - default-command: new windows get placeholder process
-		 *   (remote-new-pane hook will wire them up)
+		 * Set session options.
 		 */
 		xasprintf(&cmd,
 		    "set-option -t '%s' remain-on-exit on \\; "
-		    "set-option -t '%s' detach-on-destroy no-detached \\; "
-		    "set-option -t '%s' default-command 'exec cat > /dev/null' \\; "
-		    "set-hook -t '%s' after-new-window "
-		    "'run-shell \"tmux remote-new-pane %s\"' \\; "
-		    "set-hook -t '%s' after-split-window "
-		    "'run-shell \"tmux remote-new-pane %s\"'",
-		    sname, sname, sname,
-		    sname, rh->name,
-		    sname, rh->name);
+		    "set-option -t '%s' detach-on-destroy no-detached",
+		    sname, sname);
 		state = cmdq_new_state(NULL, NULL, 0);
 		cmd_parse_and_append(cmd, NULL, NULL, state, &error);
 		cmdq_free_state(state);
 		free(cmd);
 
-		log_debug("remote: created session %s", sname);
+		log_debug("remote: queued session %s", sname);
 		free(sname);
 	}
 
-	/*
-	 * The sessions/windows are created via queued commands that run
-	 * on the next event loop. We need to mark the panes as PANE_REMOTE
-	 * after they're created. Queue a callback to do this.
-	 */
+	/* After sessions are created, mark them as remote. */
 	{
 		struct cmdq_item *cb_item;
 		cb_item = cmdq_get_callback(remote_mark_panes_cb, rh);
@@ -639,8 +621,9 @@ remote_spawn_sessions(struct remote_host *rh)
 }
 
 /*
- * Callback to mark newly-created panes as PANE_REMOTE after the
- * new-session/new-window commands have executed.
+ * Callback that runs after queued new-session commands. Marks each
+ * session as remote (so spawn_pane handles future panes natively)
+ * and retroactively marks existing panes as PANE_REMOTE.
  */
 static enum cmd_retval
 remote_mark_panes_cb(__unused struct cmdq_item *item, void *data)
@@ -661,10 +644,12 @@ remote_mark_panes_cb(__unused struct cmdq_item *item, void *data)
 		if (s == NULL)
 			continue;
 
+		/* Mark the session itself as remote. */
+		remote_set_session_remote(s, rh, rs->name);
+
 		/*
-		 * Match remote windows to local windows by iterating both
-		 * lists in order. We created local windows in the same
-		 * order as remote windows.
+		 * Retroactively mark existing panes as PANE_REMOTE.
+		 * Match remote windows to local windows in order.
 		 */
 		wl = RB_MIN(winlinks, &s->windows);
 		TAILQ_FOREACH(rw, &rs->windows, entry) {
@@ -681,30 +666,46 @@ remote_mark_panes_cb(__unused struct cmdq_item *item, void *data)
 				wp->remote_pane = rp->id;
 				log_debug("remote: marked %%%u -> remote %%%u",
 				    wp->id, rp->id);
-
-				/*
-				 * Request initial screen content. Send a
-				 * no-op to the remote pane to trigger %output
-				 * with the current prompt/screen.
-				 */
-				{
-					struct bufferevent *bev;
-					char refresh[64];
-
-					bev = job_get_event(rh->job);
-					if (bev != NULL) {
-						snprintf(refresh, sizeof refresh,
-						    "send-keys -t %%%u ''\n",
-						    rp->id);
-						bufferevent_write(bev, refresh,
-						    strlen(refresh));
-					}
-				}
 			}
 			wl = RB_NEXT(winlinks, &s->windows, wl);
 		}
 	}
+
+	/* Trigger initial screen content for all proxy panes. */
+	{
+		struct bufferevent *bev = job_get_event(rh->job);
+		if (bev != NULL) {
+			char cmd[64];
+			TAILQ_FOREACH(rs, &rh->sessions, entry) {
+				TAILQ_FOREACH(rw, &rs->windows, entry) {
+					rp = TAILQ_FIRST(&rw->panes);
+					if (rp == NULL)
+						continue;
+					snprintf(cmd, sizeof cmd,
+					    "send-keys -t %%%u ''\n", rp->id);
+					bufferevent_write(bev, cmd,
+					    strlen(cmd));
+				}
+			}
+		}
+	}
+
 	return (CMD_RETURN_NORMAL);
+}
+
+/*
+ * Mark a session as remote. Future spawn_pane() calls in this session
+ * will automatically create proxy panes.
+ */
+static void
+remote_set_session_remote(struct session *s, struct remote_host *rh,
+    const char *remote_session_name)
+{
+	s->remote = rh;
+	free(s->remote_session);
+	s->remote_session = xstrdup(remote_session_name);
+	log_debug("remote: session %s -> %s/%s", s->name, rh->name,
+	    remote_session_name);
 }
 
 static void
@@ -745,8 +746,29 @@ remote_find_proxy_pane(struct remote_host *rh, u_int remote_pane_id)
 }
 
 /*
+ * Create a new window on the remote tmux via control mode.
+ * Called from spawn_pane() when a new pane is created in a remote session.
+ */
+void
+remote_create_window(struct remote_host *rh, const char *remote_session)
+{
+	struct bufferevent	*bev;
+	char			 cmd[256];
+
+	if (rh->state != REMOTE_READY || rh->job == NULL)
+		return;
+
+	bev = job_get_event(rh->job);
+	if (bev == NULL)
+		return;
+
+	snprintf(cmd, sizeof cmd, "new-window -t '%s'\n", remote_session);
+	bufferevent_write(bev, cmd, strlen(cmd));
+	log_debug("remote: created window on %s/%s", rh->name, remote_session);
+}
+
+/*
  * Send a keystroke to a remote pane via the control mode connection.
- * The key is translated to its string name and sent as send-keys.
  */
 void
 remote_send_key(struct window_pane *wp, key_code key,

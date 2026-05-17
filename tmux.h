@@ -1534,6 +1534,10 @@ struct session {
 
 	int		 references;
 
+	/* Remote session fields (NULL if local). */
+	struct remote_host *remote;
+	char		*remote_session;	/* name on the remote */
+
 	TAILQ_ENTRY(session) gentry;
 	RB_ENTRY(session)    entry;
 };

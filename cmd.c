@@ -82,7 +82,6 @@ extern const struct cmd_entry cmd_previous_window_entry;
 extern const struct cmd_entry cmd_refresh_client_entry;
 extern const struct cmd_entry cmd_remote_add_entry;
 extern const struct cmd_entry cmd_remote_list_entry;
-extern const struct cmd_entry cmd_remote_new_pane_entry;
 extern const struct cmd_entry cmd_remote_open_entry;
 extern const struct cmd_entry cmd_remote_refresh_entry;
 extern const struct cmd_entry cmd_remote_remove_entry;
@@ -180,7 +179,6 @@ const struct cmd_entry *cmd_table[] = {
 	&cmd_refresh_client_entry,
 	&cmd_remote_add_entry,
 	&cmd_remote_list_entry,
-	&cmd_remote_new_pane_entry,
 	&cmd_remote_open_entry,
 	&cmd_remote_refresh_entry,
 	&cmd_remote_remove_entry,

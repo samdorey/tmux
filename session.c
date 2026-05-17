@@ -225,6 +225,7 @@ session_destroy(struct session *s, int notify, const char *from)
 	}
 
 	free((void *)s->cwd);
+	free(s->remote_session);
 
 	session_remove_ref(s, __func__);
 }
