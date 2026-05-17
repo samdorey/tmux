@@ -44,8 +44,10 @@ const struct cmd_entry cmd_remote_add_entry = {
 	.name = "remote-add",
 	.alias = "remotea",
 
-	.args = { "", 2, 3, NULL },
-	.usage = "name ssh-target [tmux-target]",
+	.args = { "", 1, 3, NULL },
+	.usage = "name [ssh-target] [tmux-target]",
+
+	.target = { .flags = CMD_FIND_SESSION },
 
 	.flags = CMD_AFTERHOOK,
 	.exec = cmd_remote_add_exec
@@ -108,13 +110,17 @@ cmd_remote_add_exec(struct cmd *self, struct cmdq_item *item)
 	ssh_target = args_string(args, 1);
 	tmux_target = args_string(args, 2); /* NULL if not provided */
 
+	/* If only one arg, use it as both name and ssh target. */
+	if (ssh_target == NULL)
+		ssh_target = name;
+
 	if (remote_find(name) != NULL) {
 		cmdq_error(item, "remote already exists: %s", name);
 		return (CMD_RETURN_ERROR);
 	}
 
 	rh = remote_add(name, ssh_target, tmux_target);
-	remote_connect(rh);
+	remote_connect(rh, item);
 
 	cmdq_print(item, "Added remote: %s (%s)", name, ssh_target);
 	return (CMD_RETURN_NORMAL);
@@ -188,19 +194,33 @@ cmd_remote_refresh_exec(struct cmd *self, struct cmdq_item *item)
 			cmdq_error(item, "remote not found: %s", name);
 			return (CMD_RETURN_ERROR);
 		}
-		if (rh->state == REMOTE_DISCONNECTED ||
-		    rh->state == REMOTE_FAILED) {
-			remote_connect(rh);
-		} else {
+		switch (rh->state) {
+		case REMOTE_DISCONNECTED:
+		case REMOTE_FAILED:
+			remote_connect(rh, item);
+			break;
+		case REMOTE_CONNECTING:
+			/* Called from auth window; start control mode. */
+			remote_connect_control(rh);
+			break;
+		case REMOTE_READY:
 			remote_refresh(rh);
+			break;
 		}
 	} else {
 		TAILQ_FOREACH(rh, &remote_hosts, entry) {
-			if (rh->state == REMOTE_DISCONNECTED ||
-			    rh->state == REMOTE_FAILED)
-				remote_connect(rh);
-			else
+			switch (rh->state) {
+			case REMOTE_DISCONNECTED:
+			case REMOTE_FAILED:
+				remote_connect(rh, item);
+				break;
+			case REMOTE_CONNECTING:
+				remote_connect_control(rh);
+				break;
+			case REMOTE_READY:
 				remote_refresh(rh);
+				break;
+			}
 		}
 	}
 	return (CMD_RETURN_NORMAL);

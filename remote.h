@@ -85,11 +85,14 @@ void			 remote_destroy(void);
 struct remote_host	*remote_add(const char *, const char *, const char *);
 void			 remote_remove(struct remote_host *);
 struct remote_host	*remote_find(const char *);
-void			 remote_connect(struct remote_host *);
+void			 remote_connect(struct remote_host *,
+			     struct cmdq_item *);
+void			 remote_connect_control(struct remote_host *);
 void			 remote_disconnect(struct remote_host *);
 void			 remote_refresh(struct remote_host *);
 void			 remote_clear_tree(struct remote_host *);
 void			 remote_open(struct remote_host *, const char *,
 			     struct cmdq_item *);
+char			*remote_control_path(struct remote_host *);
 
 #endif /* REMOTE_H */

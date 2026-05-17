@@ -117,10 +117,35 @@ remote_clear_tree(struct remote_host *rh)
 	}
 }
 
-void
-remote_connect(struct remote_host *rh)
+/*
+ * Return the SSH ControlPath for this remote host.
+ * Caller must free the result.
+ */
+char *
+remote_control_path(struct remote_host *rh)
 {
-	char	*cmd;
+	char	*path;
+
+	xasprintf(&path, "/tmp/tmux-remote-%%C-%s", rh->name);
+	return (path);
+}
+
+/*
+ * Connect to a remote host. This spawns an interactive window so the user
+ * can authenticate (enter passphrase, etc). The window runs a script that:
+ *   1. Establishes an SSH ControlMaster connection
+ *   2. Calls "tmux remote-refresh <name>" to start the control-mode link
+ *   3. Closes itself
+ */
+void
+remote_connect(struct remote_host *rh, struct cmdq_item *item)
+{
+	struct client		*tc;
+	struct session		*s;
+	struct spawn_context	 sc;
+	struct winlink		*new_wl;
+	char			*cause = NULL;
+	char			*wname, *ctrl_path, *cmd;
 
 	if (rh->state == REMOTE_CONNECTING || rh->state == REMOTE_READY)
 		return;
@@ -129,21 +154,101 @@ remote_connect(struct remote_host *rh)
 	rh->error = NULL;
 	rh->state = REMOTE_CONNECTING;
 
+	tc = cmdq_get_target_client(item);
+	if (tc == NULL || tc->session == NULL) {
+		/* No client to open a window in; try non-interactive. */
+		remote_connect_control(rh);
+		return;
+	}
+	s = tc->session;
+
+	ctrl_path = remote_control_path(rh);
+
 	/*
-	 * Build the ssh command. We use tmux -C (control mode) to get a
-	 * text-protocol interface to the remote tmux server.
+	 * Build a shell command that:
+	 * - Establishes SSH ControlMaster (interactive for passphrase)
+	 * - On success, triggers the background control-mode connection
+	 * - Then exits (closing the auth window)
+	 */
+	xasprintf(&cmd,
+	    "ssh -o ControlMaster=yes -o 'ControlPath=%s' "
+	    "-o ControlPersist=600 %s true && "
+	    "tmux remote-refresh %s; "
+	    "exit 0",
+	    ctrl_path, rh->ssh_target, rh->name);
+
+	memset(&sc, 0, sizeof sc);
+	sc.item = item;
+	sc.s = s;
+	sc.tc = tc;
+	sc.argc = 3;
+	sc.argv = xcalloc(3, sizeof *sc.argv);
+	sc.argv[0] = xstrdup("/bin/sh");
+	sc.argv[1] = xstrdup("-c");
+	sc.argv[2] = xstrdup(cmd);
+	sc.environ = environ_create();
+	xasprintf(&wname, "[auth:%s]", rh->name);
+	sc.name = wname;
+	sc.idx = -1;
+	sc.cwd = NULL;
+	sc.flags = 0;
+
+	new_wl = spawn_window(&sc, &cause);
+	if (new_wl == NULL) {
+		cmdq_error(item, "spawn auth window failed: %s", cause);
+		free(cause);
+		rh->state = REMOTE_FAILED;
+		rh->error = xstrdup("failed to open auth window");
+	}
+
+	cmd_free_argv(sc.argc, sc.argv);
+	environ_free(sc.environ);
+	free(wname);
+	free(ctrl_path);
+	free(cmd);
+}
+
+/*
+ * Start the background control-mode connection, optionally reusing an
+ * SSH ControlMaster socket if one exists.
+ */
+void
+remote_connect_control(struct remote_host *rh)
+{
+	char	*cmd, *ctrl_path;
+
+	if (rh->state == REMOTE_READY)
+		return;
+
+	/* If we were CONNECTING from auth window, keep that state. */
+	if (rh->state != REMOTE_CONNECTING) {
+		free(rh->error);
+		rh->error = NULL;
+		rh->state = REMOTE_CONNECTING;
+	}
+
+	ctrl_path = remote_control_path(rh);
+
+	/*
+	 * Build the ssh command with ControlPath so it reuses the
+	 * authenticated master connection.
 	 */
 	if (rh->tmux_target != NULL)
-		xasprintf(&cmd, "ssh %s tmux -C new-session -A -t %s",
-		    rh->ssh_target, rh->tmux_target);
+		xasprintf(&cmd,
+		    "ssh -o 'ControlPath=%s' -o ControlMaster=no "
+		    "%s tmux -C new-session -A -t %s",
+		    ctrl_path, rh->ssh_target, rh->tmux_target);
 	else
-		xasprintf(&cmd, "ssh %s tmux -C new-session -A",
-		    rh->ssh_target);
+		xasprintf(&cmd,
+		    "ssh -o 'ControlPath=%s' -o ControlMaster=no "
+		    "%s tmux -C new-session -A",
+		    ctrl_path, rh->ssh_target);
 
 	rh->job = job_run(cmd, 0, NULL, NULL, NULL, NULL,
 	    remote_update_cb, remote_complete_cb, remote_free_cb,
 	    rh, JOB_NOWAIT | JOB_KEEPWRITE, -1, -1);
 	free(cmd);
+	free(ctrl_path);
 }
 
 void
