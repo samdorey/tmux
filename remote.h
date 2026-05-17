@@ -59,6 +59,14 @@ struct remote_session {
 };
 TAILQ_HEAD(remote_sessions, remote_session);
 
+/* Parsing state for control mode responses. */
+enum remote_parse_state {
+	PARSE_IDLE,
+	PARSE_SESSIONS,
+	PARSE_WINDOWS,
+	PARSE_PANES
+};
+
 /* A remote host definition. */
 struct remote_host {
 	char				*name;
@@ -70,6 +78,7 @@ struct remote_host {
 
 	struct job			*job;
 	struct evbuffer			*pending;	/* partial line buf */
+	enum remote_parse_state		 parse_state;
 	struct remote_sessions		 sessions;
 
 	TAILQ_ENTRY(remote_host)	 entry;

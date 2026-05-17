@@ -23,7 +23,6 @@
 #include <string.h>
 
 #include "tmux.h"
-#include "remote.h"
 
 static struct screen	*window_tree_init(struct window_mode_entry *,
 			     struct cmd_find_state *, struct args *);
@@ -95,10 +94,6 @@ enum window_tree_type {
 	WINDOW_TREE_SESSION,
 	WINDOW_TREE_WINDOW,
 	WINDOW_TREE_PANE,
-	WINDOW_TREE_REMOTE_HOST,
-	WINDOW_TREE_REMOTE_SESSION,
-	WINDOW_TREE_REMOTE_WINDOW,
-	WINDOW_TREE_REMOTE_PANE,
 };
 
 struct window_tree_itemdata {
@@ -106,8 +101,6 @@ struct window_tree_itemdata {
 	int			session;
 	int			winlink;
 	int			pane;
-	char			*remote_name;	/* for REMOTE_* types */
-	char			*remote_target;	/* session:window.pane */
 };
 
 struct window_tree_modedata {
@@ -152,12 +145,6 @@ window_tree_pull_item(struct window_tree_itemdata *item, struct session **sp,
 {
 	*wp = NULL;
 	*wlp = NULL;
-	*sp = NULL;
-
-	/* Remote items don't map to local sessions. */
-	if (item->type >= WINDOW_TREE_REMOTE_HOST)
-		return;
-
 	*sp = session_find_by_id(item->session);
 	if (*sp == NULL)
 		return;
@@ -201,8 +188,6 @@ window_tree_add_item(struct window_tree_modedata *data)
 static void
 window_tree_free_item(struct window_tree_itemdata *item)
 {
-	free(item->remote_name);
-	free(item->remote_target);
 	free(item);
 }
 
@@ -362,121 +347,6 @@ window_tree_build_session(struct session *s, void *modedata,
 }
 
 static void
-window_tree_build_remote(void *modedata)
-{
-	struct window_tree_modedata	*data = modedata;
-	struct window_tree_itemdata	*item;
-	struct mode_tree_item		*mti_host, *mti_sess, *mti_win;
-	struct remote_host		*rh;
-	struct remote_session		*rs;
-	struct remote_window		*rw;
-	struct remote_pane		*rp;
-	char				*text, *target;
-
-	TAILQ_FOREACH(rh, &remote_hosts, entry) {
-		/* Add the remote host as a top-level group. */
-		item = window_tree_add_item(data);
-		item->type = WINDOW_TREE_REMOTE_HOST;
-		item->session = -1;
-		item->winlink = -1;
-		item->pane = -1;
-		item->remote_name = xstrdup(rh->name);
-		item->remote_target = NULL;
-
-		switch (rh->state) {
-		case REMOTE_DISCONNECTED:
-			xasprintf(&text, "[disconnected]");
-			break;
-		case REMOTE_CONNECTING:
-			xasprintf(&text, "[connecting...]");
-			break;
-		case REMOTE_READY:
-			xasprintf(&text, "%s", rh->ssh_target);
-			break;
-		case REMOTE_FAILED:
-			xasprintf(&text, "[failed: %s]",
-			    rh->error ? rh->error : "unknown");
-			break;
-		}
-
-		mti_host = mode_tree_add(data->data, NULL, item,
-		    (uint64_t)(uintptr_t)rh, rh->name, text, 0);
-		free(text);
-
-		if (rh->state != REMOTE_READY)
-			continue;
-
-		/* Add remote sessions under the host. */
-		TAILQ_FOREACH(rs, &rh->sessions, entry) {
-			item = window_tree_add_item(data);
-			item->type = WINDOW_TREE_REMOTE_SESSION;
-			item->session = -1;
-			item->winlink = -1;
-			item->pane = -1;
-			item->remote_name = xstrdup(rh->name);
-			item->remote_target = xstrdup(rs->name);
-
-			xasprintf(&text, "%d windows",
-			    (int)TAILQ_EMPTY(&rs->windows) ? 0 : 1);
-			/* Count windows. */
-			{
-				int wcount = 0;
-				struct remote_window *rw2;
-				TAILQ_FOREACH(rw2, &rs->windows, entry)
-					wcount++;
-				free(text);
-				xasprintf(&text, "%d windows", wcount);
-			}
-
-			mti_sess = mode_tree_add(data->data, mti_host, item,
-			    (uint64_t)(uintptr_t)rs, rs->name, text, 0);
-			free(text);
-
-			/* Add remote windows under the session. */
-			TAILQ_FOREACH(rw, &rs->windows, entry) {
-				item = window_tree_add_item(data);
-				item->type = WINDOW_TREE_REMOTE_WINDOW;
-				item->session = -1;
-				item->winlink = -1;
-				item->pane = -1;
-				item->remote_name = xstrdup(rh->name);
-				xasprintf(&target, "%s:%d", rs->name, rw->idx);
-				item->remote_target = target;
-
-				xasprintf(&text, "%s%s", rw->name,
-				    rw->active ? " (active)" : "");
-
-				mti_win = mode_tree_add(data->data, mti_sess,
-				    item, (uint64_t)(uintptr_t)rw, rw->name,
-				    text, -1);
-				free(text);
-
-				/* Add remote panes under the window. */
-				TAILQ_FOREACH(rp, &rw->panes, entry) {
-					char pname[32];
-
-					item = window_tree_add_item(data);
-					item->type = WINDOW_TREE_REMOTE_PANE;
-					item->session = -1;
-					item->winlink = -1;
-					item->pane = -1;
-					item->remote_name = xstrdup(rh->name);
-					xasprintf(&target, "%s:%d.%u",
-					    rs->name, rw->idx, rp->id);
-					item->remote_target = target;
-
-					snprintf(pname, sizeof pname,
-					    "%%%u", rp->id);
-					mode_tree_add(data->data, mti_win,
-					    item, (uint64_t)(uintptr_t)rp,
-					    pname, rp->title, -1);
-				}
-			}
-		}
-	}
-}
-
-static void
 window_tree_build(void *modedata, struct sort_criteria *sort_crit,
     uint64_t *tag, const char *filter)
 {
@@ -507,9 +377,6 @@ window_tree_build(void *modedata, struct sort_criteria *sort_crit,
 		window_tree_build_session(l[i], modedata, sort_crit, filter);
 	}
 
-	/* Add remote hosts after local sessions. */
-	window_tree_build_remote(modedata);
-
 	switch (data->type) {
 	case WINDOW_TREE_NONE:
 		break;
@@ -524,11 +391,6 @@ window_tree_build(void *modedata, struct sort_criteria *sort_crit,
 			*tag = (uint64_t)data->fs.wl;
 		else
 			*tag = (uint64_t)data->fs.wp;
-		break;
-	case WINDOW_TREE_REMOTE_HOST:
-	case WINDOW_TREE_REMOTE_SESSION:
-	case WINDOW_TREE_REMOTE_WINDOW:
-	case WINDOW_TREE_REMOTE_PANE:
 		break;
 	}
 }
@@ -862,11 +724,6 @@ window_tree_draw(void *modedata, void *itemdata, struct screen_write_ctx *ctx,
 	case WINDOW_TREE_PANE:
 		screen_write_preview(ctx, &wp->base, sx, sy);
 		break;
-	case WINDOW_TREE_REMOTE_HOST:
-	case WINDOW_TREE_REMOTE_SESSION:
-	case WINDOW_TREE_REMOTE_WINDOW:
-	case WINDOW_TREE_REMOTE_PANE:
-		break;
 	}
 }
 
@@ -912,20 +769,6 @@ window_tree_search(__unused void *modedata, void *itemdata, const char *ss,
 			retval = (strstr(cmd, ss) != NULL);
 		free(cmd);
 		return (retval);
-	case WINDOW_TREE_REMOTE_HOST:
-		if (item->remote_name == NULL)
-			return (0);
-		if (icase)
-			return (strcasestr(item->remote_name, ss) != NULL);
-		return (strstr(item->remote_name, ss) != NULL);
-	case WINDOW_TREE_REMOTE_SESSION:
-	case WINDOW_TREE_REMOTE_WINDOW:
-	case WINDOW_TREE_REMOTE_PANE:
-		if (item->remote_target == NULL)
-			return (0);
-		if (icase)
-			return (strcasestr(item->remote_target, ss) != NULL);
-		return (strstr(item->remote_target, ss) != NULL);
 	}
 	return (0);
 }
@@ -957,9 +800,7 @@ window_tree_get_key(void *modedata, void *itemdata, u_int line)
 
 	ft = format_create(NULL, NULL, FORMAT_NONE, 0);
 	window_tree_pull_item(item, &s, &wl, &wp);
-	if (item->type >= WINDOW_TREE_REMOTE_HOST)
-		format_defaults(ft, NULL, NULL, NULL, NULL);
-	else if (item->type == WINDOW_TREE_SESSION)
+	if (item->type == WINDOW_TREE_SESSION)
 		format_defaults(ft, NULL, s, NULL, NULL);
 	else if (item->type == WINDOW_TREE_WINDOW)
 		format_defaults(ft, NULL, s, wl, NULL);
@@ -1187,12 +1028,6 @@ window_tree_get_target(struct window_tree_itemdata *item,
 			break;
 		xasprintf(&target, "=%s:%u.%%%u", s->name, wl->idx, wp->id);
 		break;
-	case WINDOW_TREE_REMOTE_HOST:
-	case WINDOW_TREE_REMOTE_SESSION:
-	case WINDOW_TREE_REMOTE_WINDOW:
-	case WINDOW_TREE_REMOTE_PANE:
-		/* Handled separately via remote_open. */
-		break;
 	}
 	if (target == NULL)
 		cmd_find_clear_state(fs, 0);
@@ -1285,12 +1120,6 @@ window_tree_kill_each(__unused void *modedata, void *itemdata,
 	case WINDOW_TREE_PANE:
 		if (wp != NULL)
 			server_kill_pane(wp);
-		break;
-	case WINDOW_TREE_REMOTE_HOST:
-	case WINDOW_TREE_REMOTE_SESSION:
-	case WINDOW_TREE_REMOTE_WINDOW:
-	case WINDOW_TREE_REMOTE_PANE:
-		/* Remote items cannot be killed in V1. */
 		break;
 	}
 }
@@ -1469,11 +1298,6 @@ again:
 				break;
 			xasprintf(&prompt, "Kill pane %u? ", idx);
 			break;
-		case WINDOW_TREE_REMOTE_HOST:
-		case WINDOW_TREE_REMOTE_SESSION:
-		case WINDOW_TREE_REMOTE_WINDOW:
-		case WINDOW_TREE_REMOTE_PANE:
-			break;
 		}
 		if (prompt == NULL)
 			break;
@@ -1509,26 +1333,11 @@ again:
 		free(prompt);
 		break;
 	case '\r':
-		if (item->type >= WINDOW_TREE_REMOTE_HOST) {
-			/* Remote item: open via remote-open command. */
-			char	*rcmd;
-			if (item->remote_target != NULL)
-				xasprintf(&rcmd, "remote-open %s:%s",
-				    item->remote_name, item->remote_target);
-			else
-				xasprintf(&rcmd, "remote-open %s",
-				    item->remote_name);
-			mode_tree_run_command(c, NULL, rcmd, "");
-			free(rcmd);
-			finished = 1;
-		} else {
-			name = window_tree_get_target(item, &fs);
-			if (name != NULL)
-				mode_tree_run_command(c, NULL, data->command,
-				    name);
-			finished = 1;
-			free(name);
-		}
+		name = window_tree_get_target(item, &fs);
+		if (name != NULL)
+			mode_tree_run_command(c, NULL, data->command, name);
+		finished = 1;
+		free(name);
 		break;
 	}
 	if (finished)
