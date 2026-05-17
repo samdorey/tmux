@@ -52,6 +52,7 @@ struct environ;
 struct format_job_tree;
 struct format_tree;
 struct hyperlinks_uri;
+struct remote_host;
 struct hyperlinks;
 struct input_ctx;
 struct input_request;
@@ -1278,6 +1279,7 @@ struct window_pane {
 #define PANE_THEMECHANGED 0x2000
 #define PANE_UNSEENCHANGES 0x4000
 #define PANE_REDRAWSCROLLBAR 0x8000
+#define PANE_REMOTE 0x10000
 
 	u_int		 sb_slider_y;
 	u_int		 sb_slider_h;
@@ -1333,6 +1335,10 @@ struct window_pane {
 	int		 control_fg;
 
 	struct style	 scrollbar_style;
+
+	/* Remote proxy pane fields (PANE_REMOTE). */
+	struct remote_host *remote;	/* owning remote host */
+	u_int		 remote_pane;	/* remote pane ID (%<id>) */
 
 	TAILQ_ENTRY(window_pane) entry;  /* link in list of all panes */
 	TAILQ_ENTRY(window_pane) sentry; /* link in list of last visited */

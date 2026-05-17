@@ -103,5 +103,8 @@ void			 remote_clear_tree(struct remote_host *);
 void			 remote_open(struct remote_host *, const char *,
 			     struct cmdq_item *);
 char			*remote_control_path(struct remote_host *);
+void			 remote_send_key(struct window_pane *, key_code,
+			     struct mouse_event *);
+struct window_pane	*remote_find_proxy_pane(struct remote_host *, u_int);
 
 #endif /* REMOTE_H */

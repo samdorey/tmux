@@ -32,6 +32,7 @@
 #include <unistd.h>
 
 #include "tmux.h"
+#include "remote.h"
 
 /*
  * Each window is attached to a number of panes, each of which is a pty. This
@@ -1291,6 +1292,11 @@ window_pane_key(struct window_pane *wp, struct client *c, struct session *s,
 
 	if (wp->fd == -1 || wp->flags & PANE_INPUTOFF)
 		return (0);
+
+	if (wp->flags & PANE_REMOTE) {
+		remote_send_key(wp, key, m);
+		return (0);
+	}
 
 	if (input_key_pane(wp, key, m) != 0)
 		return (-1);

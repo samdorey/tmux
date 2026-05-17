@@ -30,11 +30,14 @@ static void	remote_update_cb(struct job *);
 static void	remote_complete_cb(struct job *);
 static void	remote_free_cb(void *);
 static void	remote_parse_line(struct remote_host *, const char *);
+static void	remote_parse_output(struct remote_host *, const char *);
 static void	remote_parse_sessions(struct remote_host *, const char *);
 static void	remote_parse_windows(struct remote_host *, const char *);
 static void	remote_parse_panes(struct remote_host *, const char *);
-static void	remote_spawn_sessions(struct remote_host *);
-static void	remote_destroy_sessions(struct remote_host *);
+static void		remote_spawn_sessions(struct remote_host *);
+static void		remote_destroy_sessions(struct remote_host *);
+static size_t		remote_decode_output(const char *, u_char *, size_t);
+static enum cmd_retval	remote_mark_panes_cb(struct cmdq_item *, void *);
 
 void
 remote_init(void)
@@ -119,10 +122,6 @@ remote_clear_tree(struct remote_host *rh)
 	}
 }
 
-/*
- * Return the SSH ControlPath for this remote host.
- * Caller must free the result.
- */
 char *
 remote_control_path(struct remote_host *rh)
 {
@@ -132,13 +131,6 @@ remote_control_path(struct remote_host *rh)
 	return (path);
 }
 
-/*
- * Connect to a remote host. This spawns an interactive window so the user
- * can authenticate (enter passphrase, etc). The window runs a script that:
- *   1. Establishes an SSH ControlMaster connection
- *   2. Calls "tmux remote-refresh <name>" to start the control-mode link
- *   3. Closes itself
- */
 void
 remote_connect(struct remote_host *rh, struct cmdq_item *item)
 {
@@ -158,7 +150,6 @@ remote_connect(struct remote_host *rh, struct cmdq_item *item)
 
 	tc = cmdq_get_target_client(item);
 	if (tc == NULL || tc->session == NULL) {
-		/* No client to open a window in; try non-interactive. */
 		remote_connect_control(rh);
 		return;
 	}
@@ -166,12 +157,6 @@ remote_connect(struct remote_host *rh, struct cmdq_item *item)
 
 	ctrl_path = remote_control_path(rh);
 
-	/*
-	 * Build a shell command that:
-	 * - Establishes SSH ControlMaster (interactive for passphrase)
-	 * - On success, triggers the background control-mode connection
-	 * - Then exits (closing the auth window)
-	 */
 	xasprintf(&cmd,
 	    "ssh -o 'ControlPath=%s' -O check %s 2>/dev/null && { "
 	    "  tmux remote-refresh %s; exit 0; }; "
@@ -217,10 +202,6 @@ remote_connect(struct remote_host *rh, struct cmdq_item *item)
 	free(cmd);
 }
 
-/*
- * Start the background control-mode connection, optionally reusing an
- * SSH ControlMaster socket if one exists.
- */
 void
 remote_connect_control(struct remote_host *rh)
 {
@@ -229,7 +210,6 @@ remote_connect_control(struct remote_host *rh)
 	if (rh->state == REMOTE_READY)
 		return;
 
-	/* If we were CONNECTING from auth window, keep that state. */
 	if (rh->state != REMOTE_CONNECTING) {
 		free(rh->error);
 		rh->error = NULL;
@@ -238,10 +218,6 @@ remote_connect_control(struct remote_host *rh)
 
 	ctrl_path = remote_control_path(rh);
 
-	/*
-	 * Build the ssh command with ControlPath so it reuses the
-	 * authenticated master connection.
-	 */
 	if (rh->tmux_target != NULL)
 		xasprintf(&cmd,
 		    "ssh -o 'ControlPath=%s' -o ControlMaster=auto "
@@ -279,17 +255,10 @@ remote_refresh(struct remote_host *rh)
 	if (rh->state != REMOTE_READY || rh->job == NULL)
 		return;
 
-	/*
-	 * Send commands to the remote tmux control mode to list sessions,
-	 * windows, and panes. The responses will be parsed asynchronously.
-	 * After parsing completes, remote_spawn_sessions() creates local
-	 * sessions for each remote session.
-	 */
 	bev = job_get_event(rh->job);
 	if (bev == NULL)
 		return;
 
-	/* Clear existing tree before re-populating. */
 	remote_destroy_sessions(rh);
 	remote_clear_tree(rh);
 	rh->parse_state = PARSE_SESSIONS;
@@ -347,31 +316,25 @@ remote_complete_cb(struct job *job)
 static void
 remote_free_cb(void *data __attribute__((unused)))
 {
-	/* Nothing to free; rh owns everything. */
 }
 
 /*
- * Parse a line from the remote tmux control mode output.
- * Control mode outputs lines like:
- *   %begin <time> <num> <flags>
- *   <data lines>
- *   %end <time> <num> <flags>
- * Plus notifications like:
- *   %session-changed ...
- *   %exit
+ * Parse control mode output. Handle %output for proxy pane I/O,
+ * %begin/%end for command responses, and ignore other notifications.
  */
-
 static void
 remote_parse_line(struct remote_host *rh, const char *line)
 {
+	/* Handle %output — real-time pane output for proxy panes. */
+	if (strncmp(line, "%output ", 8) == 0) {
+		remote_parse_output(rh, line + 8);
+		return;
+	}
+
 	if (strncmp(line, "%begin ", 7) == 0)
 		return;
 
 	if (strncmp(line, "%end ", 5) == 0) {
-		/*
-		 * First %end while CONNECTING means the attach succeeded.
-		 * Mark ready and send list commands.
-		 */
 		if (rh->state == REMOTE_CONNECTING) {
 			rh->state = REMOTE_READY;
 			remote_clear_tree(rh);
@@ -423,6 +386,70 @@ remote_parse_line(struct remote_host *rh, const char *line)
 		remote_parse_panes(rh, line);
 		break;
 	}
+}
+
+/*
+ * Handle %output %<pane_id> <octal-escaped-data>.
+ * Decode the data and inject it into the corresponding local proxy pane
+ * via input_parse_buffer(), which feeds the terminal emulator directly.
+ */
+static void
+remote_parse_output(struct remote_host *rh, const char *line)
+{
+	u_int			 pane_id;
+	const char		*data;
+	struct window_pane	*wp;
+	u_char			*buf;
+	size_t			 len;
+
+	/* Parse: %<pane_id> <data> */
+	if (line[0] != '%')
+		return;
+	if (sscanf(line, "%%%u", &pane_id) != 1)
+		return;
+
+	data = strchr(line, ' ');
+	if (data == NULL)
+		return;
+	data++; /* skip space */
+
+	/* Find the local proxy pane for this remote pane. */
+	wp = remote_find_proxy_pane(rh, pane_id);
+	if (wp == NULL)
+		return;
+
+	/* Decode octal escapes and inject into the pane's input parser. */
+	buf = xmalloc(strlen(data) + 1);
+	len = remote_decode_output(data, buf, strlen(data) + 1);
+	if (len > 0) {
+		input_parse_buffer(wp, buf, len);
+		wp->flags |= PANE_CHANGED;
+	}
+	free(buf);
+}
+
+/*
+ * Decode control mode octal-escaped output.
+ * Characters < 0x20 and backslash are encoded as \NNN (octal).
+ * Returns number of decoded bytes.
+ */
+static size_t
+remote_decode_output(const char *in, u_char *out, size_t outsize)
+{
+	size_t	len = 0;
+
+	while (*in != '\0' && len < outsize - 1) {
+		if (in[0] == '\\' && in[1] >= '0' && in[1] <= '3' &&
+		    in[2] >= '0' && in[2] <= '7' &&
+		    in[3] >= '0' && in[3] <= '7') {
+			out[len++] = ((in[1] - '0') << 6) |
+			    ((in[2] - '0') << 3) | (in[3] - '0');
+			in += 4;
+		} else {
+			out[len++] = *in++;
+		}
+	}
+	return (len);
 }
 
 /* Parse: $id:name:attached */
@@ -504,77 +531,83 @@ found:
 }
 
 /*
- * Create local tmux sessions mirroring remote sessions.
+ * Create local proxy pane sessions mirroring the remote tree.
  *
- * For remote host "as3" with session "main" containing windows "editor"
- * and "logs", this creates local session "as3/main" with two windows,
- * each running a plain "ssh -t as3" (no inner tmux). The user navigates
- * windows and splits with their normal outer tmux keybindings.
+ * For each remote session, create a local session. For each remote window,
+ * create a local window. Each pane runs "sleep infinity" as a placeholder
+ * process; actual I/O is proxied through the control mode connection.
+ * The PANE_REMOTE flag on each pane routes keystrokes to the remote and
+ * %output notifications inject data into the local terminal emulator.
  */
 static void
 remote_spawn_sessions(struct remote_host *rh)
 {
 	struct remote_session	*rs;
-	char			*sname, *cmd, *error, *ctrl_path;
-	char			*ssh_cmd;
+	struct remote_window	*rw;
+	struct remote_pane	*rp;
+	char			*sname, *cmd, *error;
 	struct cmdq_state	*state;
 	enum cmd_parse_status	 status;
-
-	ctrl_path = remote_control_path(rh);
-
-	/* Build the base SSH command that reuses the ControlMaster socket. */
-	xasprintf(&ssh_cmd,
-	    "ssh -o 'ControlPath=%s' -o ControlMaster=auto -t %s",
-	    ctrl_path, rh->ssh_target);
-
-	/*
-	 * Build the SSH+tmux attach command. Each window attaches to the
-	 * same remote session — the remote tmux handles windows/panes,
-	 * the local tmux handles session switching via prefix+w.
-	 */
+	int			 first_win;
 
 	TAILQ_FOREACH(rs, &rh->sessions, entry) {
 		xasprintf(&sname, "%s/%s", rh->name, rs->name);
 
-		/* Skip if this local session already exists. */
 		if (session_find(sname) != NULL) {
 			free(sname);
 			continue;
 		}
 
-		/*
-		 * Create one local session per remote session. The pane
-		 * runs ssh -t <host> tmux attach -t <session>, so the
-		 * remote tmux handles windows/panes/persistence, and the
-		 * local tmux handles session switching.
-		 */
-		xasprintf(&cmd,
-		    "new-session -d -s '%s' "
-		    "'%s tmux attach-session -t \"%s\"'",
-		    sname, ssh_cmd, rs->name);
+		first_win = 1;
+		TAILQ_FOREACH(rw, &rs->windows, entry) {
+			/*
+			 * For V1, create one pane per window using the first
+			 * (active) pane. Multi-pane windows will be handled
+			 * in a future version.
+			 */
+			rp = TAILQ_FIRST(&rw->panes);
+			if (rp == NULL)
+				continue;
 
-		state = cmdq_new_state(NULL, NULL, 0);
-		status = cmd_parse_and_append(cmd, NULL, NULL,
-		    state, &error);
-		if (status == CMD_PARSE_ERROR) {
-			log_debug("remote: %s: %s", sname, error);
-			free(error);
+			if (first_win) {
+				xasprintf(&cmd,
+				    "new-session -d -s '%s' -n '%s' -x 80 -y 24 "
+				    "'exec sleep infinity'",
+				    sname, rw->name);
+				first_win = 0;
+			} else {
+				xasprintf(&cmd,
+				    "new-window -d -t '%s:' -n '%s' "
+				    "'exec sleep infinity'",
+				    sname, rw->name);
+			}
+
+			state = cmdq_new_state(NULL, NULL, 0);
+			status = cmd_parse_and_append(cmd, NULL, NULL,
+			    state, &error);
+			if (status == CMD_PARSE_ERROR) {
+				log_debug("remote: %s: %s", sname, error);
+				free(error);
+			}
+			cmdq_free_state(state);
+			free(cmd);
 		}
-		cmdq_free_state(state);
-		free(cmd);
+
+		if (first_win) {
+			/* No windows — shouldn't happen. */
+			free(sname);
+			continue;
+		}
 
 		/*
 		 * Set session options:
-		 * - remain-on-exit: panes stay when SSH disconnects
-		 * - detach-on-destroy: switch to another session, don't detach
-		 * - default-command: prefix+c opens SSH to remote, not local shell
+		 * - remain-on-exit: panes stay if sleep is killed
+		 * - detach-on-destroy: switch to another session
 		 */
 		xasprintf(&cmd,
 		    "set-option -t '%s' remain-on-exit on \\; "
-		    "set-option -t '%s' detach-on-destroy no-detached \\; "
-		    "set-option -t '%s' default-command "
-		    "'%s tmux attach-session -t \"%s\"'",
-		    sname, sname, sname, ssh_cmd, rs->name);
+		    "set-option -t '%s' detach-on-destroy no-detached",
+		    sname, sname);
 		state = cmdq_new_state(NULL, NULL, 0);
 		cmd_parse_and_append(cmd, NULL, NULL, state, &error);
 		cmdq_free_state(state);
@@ -583,14 +616,71 @@ remote_spawn_sessions(struct remote_host *rh)
 		log_debug("remote: created session %s", sname);
 		free(sname);
 	}
-	free(ssh_cmd);
-	free(ctrl_path);
+
+	/*
+	 * The sessions/windows are created via queued commands that run
+	 * on the next event loop. We need to mark the panes as PANE_REMOTE
+	 * after they're created. Queue a callback to do this.
+	 */
+	{
+		struct cmdq_item *cb_item;
+		cb_item = cmdq_get_callback(remote_mark_panes_cb, rh);
+		cmdq_append(NULL, cb_item);
+	}
 }
 
 /*
- * Destroy all local sessions that belong to this remote host.
- * Sessions are identified by the "hostname/" prefix in their name.
+ * Callback to mark newly-created panes as PANE_REMOTE after the
+ * new-session/new-window commands have executed.
  */
+static enum cmd_retval
+remote_mark_panes_cb(__unused struct cmdq_item *item, void *data)
+{
+	struct remote_host	*rh = data;
+	struct remote_session	*rs;
+	struct remote_window	*rw;
+	struct remote_pane	*rp;
+	struct session		*s;
+	struct winlink		*wl;
+	struct window_pane	*wp;
+	char			*sname;
+	int			 widx;
+
+	TAILQ_FOREACH(rs, &rh->sessions, entry) {
+		xasprintf(&sname, "%s/%s", rh->name, rs->name);
+		s = session_find(sname);
+		free(sname);
+		if (s == NULL)
+			continue;
+
+		widx = 0;
+		TAILQ_FOREACH(rw, &rs->windows, entry) {
+			rp = TAILQ_FIRST(&rw->panes);
+			if (rp == NULL)
+				continue;
+
+			/* Find the local window by index. */
+			wl = winlink_find_by_index(&s->windows, widx);
+			if (wl == NULL) {
+				widx++;
+				continue;
+			}
+
+			/* Mark the first pane as remote proxy. */
+			wp = wl->window->active;
+			if (wp != NULL) {
+				wp->flags |= PANE_REMOTE;
+				wp->remote = rh;
+				wp->remote_pane = rp->id;
+				log_debug("remote: marked %%%u -> remote %%%u",
+				    wp->id, rp->id);
+			}
+			widx++;
+		}
+	}
+	return (CMD_RETURN_NORMAL);
+}
+
 static void
 remote_destroy_sessions(struct remote_host *rh)
 {
@@ -612,10 +702,77 @@ remote_destroy_sessions(struct remote_host *rh)
 }
 
 /*
- * Open/switch to a remote session. If target is NULL, switch to the first
- * session for this host. If target names a remote session, switch to the
- * corresponding local session "host/target".
+ * Find a local proxy pane that corresponds to a remote pane ID.
  */
+struct window_pane *
+remote_find_proxy_pane(struct remote_host *rh, u_int remote_pane_id)
+{
+	struct window_pane	*wp;
+
+	RB_FOREACH(wp, window_pane_tree, &all_window_panes) {
+		if ((wp->flags & PANE_REMOTE) &&
+		    wp->remote == rh &&
+		    wp->remote_pane == remote_pane_id)
+			return (wp);
+	}
+	return (NULL);
+}
+
+/*
+ * Send a keystroke to a remote pane via the control mode connection.
+ * The key is translated to its string name and sent as send-keys.
+ */
+void
+remote_send_key(struct window_pane *wp, key_code key,
+    __unused struct mouse_event *m)
+{
+	struct remote_host	*rh = wp->remote;
+	struct bufferevent	*bev;
+	const char		*keystr;
+	char			 cmd[512];
+	u_char			 ch;
+
+	if (rh == NULL || rh->job == NULL || rh->state != REMOTE_READY)
+		return;
+
+	bev = job_get_event(rh->job);
+	if (bev == NULL)
+		return;
+
+	/* Ignore mouse events for now. */
+	if (KEYC_IS_MOUSE(key))
+		return;
+
+	/*
+	 * For simple ASCII characters, send them as literal text which is
+	 * more reliable than key names for things like quotes, semicolons.
+	 */
+	if (key < 0x80 && key >= 0x20) {
+		ch = (u_char)key;
+		/* Escape single quotes for the shell. */
+		if (ch == '\'')
+			snprintf(cmd, sizeof cmd,
+			    "send-keys -t %%%u -l \"'\"\n", wp->remote_pane);
+		else if (ch == '\\')
+			snprintf(cmd, sizeof cmd,
+			    "send-keys -t %%%u -l '\\\\'\n", wp->remote_pane);
+		else
+			snprintf(cmd, sizeof cmd,
+			    "send-keys -t %%%u -l '%c'\n", wp->remote_pane, ch);
+		bufferevent_write(bev, cmd, strlen(cmd));
+		return;
+	}
+
+	/* For control characters (Ctrl+C, Enter, etc.), use key names. */
+	keystr = key_string_lookup_key(key, 0);
+	if (keystr == NULL || *keystr == '\0')
+		return;
+
+	snprintf(cmd, sizeof cmd, "send-keys -t %%%u %s\n",
+	    wp->remote_pane, keystr);
+	bufferevent_write(bev, cmd, strlen(cmd));
+}
+
 void
 remote_open(struct remote_host *rh, const char *target, struct cmdq_item *item)
 {
@@ -626,7 +783,6 @@ remote_open(struct remote_host *rh, const char *target, struct cmdq_item *item)
 	if (target != NULL)
 		xasprintf(&sname, "%s/%s", rh->name, target);
 	else {
-		/* Pick first session for this host. */
 		struct remote_session *rs = TAILQ_FIRST(&rh->sessions);
 		if (rs == NULL) {
 			cmdq_error(item, "no sessions on remote %s", rh->name);
@@ -649,7 +805,6 @@ remote_open(struct remote_host *rh, const char *target, struct cmdq_item *item)
 		return;
 	}
 
-	/* Switch this client to the remote session. */
 	server_client_set_session(tc, s);
 	free(sname);
 }
