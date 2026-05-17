@@ -403,7 +403,7 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		/* Parent: mark as remote proxy. */
 		new_wp->flags |= PANE_REMOTE;
 		new_wp->remote = s->remote;
-		new_wp->remote_pane = 0; /* mapped later by refresh */
+		new_wp->remote_pane = UINT_MAX; /* unmapped, set on first %output */
 		log_debug("spawn: remote proxy pane %%%u for %s",
 		    new_wp->id, s->remote->name);
 

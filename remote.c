@@ -425,14 +425,14 @@ remote_parse_output(struct remote_host *rh, const char *line)
 	if (wp == NULL) {
 		/*
 		 * No mapped pane — look for an unmapped proxy pane
-		 * (remote_pane == 0) and assign this remote pane to it.
-		 * This handles panes created by prefix+c where we don't
-		 * know the remote ID until output arrives.
+		 * (remote_pane == UINT_MAX) and assign this remote pane
+		 * to it. This handles panes created by prefix+c where
+		 * we don't know the remote ID until output arrives.
 		 */
 		RB_FOREACH(wp, window_pane_tree, &all_window_panes) {
 			if ((wp->flags & PANE_REMOTE) &&
 			    wp->remote == rh &&
-			    wp->remote_pane == 0) {
+			    wp->remote_pane == UINT_MAX) {
 				wp->remote_pane = pane_id;
 				log_debug("remote: auto-mapped %%%u -> "
 				    "remote %%%u", wp->id, pane_id);
@@ -805,6 +805,8 @@ remote_send_key(struct window_pane *wp, key_code key,
 
 	if (rh == NULL || rh->job == NULL || rh->state != REMOTE_READY)
 		return;
+	if (wp->remote_pane == UINT_MAX)
+		return; /* not mapped yet */
 
 	bev = job_get_event(rh->job);
 	if (bev == NULL)
