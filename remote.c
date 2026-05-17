@@ -515,12 +515,10 @@ static void
 remote_spawn_sessions(struct remote_host *rh)
 {
 	struct remote_session	*rs;
-	struct remote_window	*rw;
 	char			*sname, *cmd, *error, *ctrl_path;
 	char			*ssh_cmd;
 	struct cmdq_state	*state;
 	enum cmd_parse_status	 status;
-	int			 first;
 
 	ctrl_path = remote_control_path(rh);
 
@@ -528,6 +526,12 @@ remote_spawn_sessions(struct remote_host *rh)
 	xasprintf(&ssh_cmd,
 	    "ssh -o 'ControlPath=%s' -o ControlMaster=auto -t %s",
 	    ctrl_path, rh->ssh_target);
+
+	/*
+	 * Build the SSH+tmux attach command. Each window attaches to the
+	 * same remote session — the remote tmux handles windows/panes,
+	 * the local tmux handles session switching via prefix+w.
+	 */
 
 	TAILQ_FOREACH(rs, &rh->sessions, entry) {
 		xasprintf(&sname, "%s/%s", rh->name, rs->name);
@@ -538,50 +542,26 @@ remote_spawn_sessions(struct remote_host *rh)
 			continue;
 		}
 
-		first = 1;
-		TAILQ_FOREACH(rw, &rs->windows, entry) {
-			if (first) {
-				/*
-				 * Create session with the first window.
-				 * Name the window after the remote window.
-				 */
-				xasprintf(&cmd,
-				    "new-session -d -s '%s' -n '%s' '%s'",
-				    sname, rw->name, ssh_cmd);
-				first = 0;
-			} else {
-				/*
-				 * Add subsequent windows to the session.
-				 */
-				xasprintf(&cmd,
-				    "new-window -d -t '%s:' -n '%s' '%s'",
-				    sname, rw->name, ssh_cmd);
-			}
+		/*
+		 * Create one local session per remote session. The pane
+		 * runs ssh -t <host> tmux attach -t <session>, so the
+		 * remote tmux handles windows/panes/persistence, and the
+		 * local tmux handles session switching.
+		 */
+		xasprintf(&cmd,
+		    "new-session -d -s '%s' "
+		    "'%s tmux attach-session -t \"%s\"'",
+		    sname, ssh_cmd, rs->name);
 
-			state = cmdq_new_state(NULL, NULL, 0);
-			status = cmd_parse_and_append(cmd, NULL, NULL,
-			    state, &error);
-			if (status == CMD_PARSE_ERROR) {
-				log_debug("remote: %s: %s", sname, error);
-				free(error);
-			}
-			cmdq_free_state(state);
-			free(cmd);
+		state = cmdq_new_state(NULL, NULL, 0);
+		status = cmd_parse_and_append(cmd, NULL, NULL,
+		    state, &error);
+		if (status == CMD_PARSE_ERROR) {
+			log_debug("remote: %s: %s", sname, error);
+			free(error);
 		}
-
-		if (first) {
-			/*
-			 * Session has no windows (shouldn't happen, but
-			 * create an empty one just in case).
-			 */
-			xasprintf(&cmd,
-			    "new-session -d -s '%s' '%s'",
-			    sname, ssh_cmd);
-			state = cmdq_new_state(NULL, NULL, 0);
-			cmd_parse_and_append(cmd, NULL, NULL, state, &error);
-			cmdq_free_state(state);
-			free(cmd);
-		}
+		cmdq_free_state(state);
+		free(cmd);
 
 		/*
 		 * Set session options:
@@ -592,8 +572,9 @@ remote_spawn_sessions(struct remote_host *rh)
 		xasprintf(&cmd,
 		    "set-option -t '%s' remain-on-exit on \\; "
 		    "set-option -t '%s' detach-on-destroy no-detached \\; "
-		    "set-option -t '%s' default-command '%s'",
-		    sname, sname, sname, ssh_cmd);
+		    "set-option -t '%s' default-command "
+		    "'%s tmux attach-session -t \"%s\"'",
+		    sname, sname, sname, ssh_cmd, rs->name);
 		state = cmdq_new_state(NULL, NULL, 0);
 		cmd_parse_and_append(cmd, NULL, NULL, state, &error);
 		cmdq_free_state(state);
