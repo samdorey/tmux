@@ -504,25 +504,30 @@ found:
 }
 
 /*
- * Create local tmux sessions for each remote session.
+ * Create local tmux sessions mirroring remote sessions.
  *
- * For remote host "as3" with sessions "main" and "dev", this creates:
- *   as3/main  - one window, one pane: ssh -t as3 tmux attach -t main
- *   as3/dev   - one window, one pane: ssh -t as3 tmux attach -t dev
- *
- * These appear as regular sessions in prefix+w, prefix+s, etc.
- * We queue new-session commands on the server command queue since we're
- * called from a job callback without a cmdq_item context.
+ * For remote host "as3" with session "main" containing windows "editor"
+ * and "logs", this creates local session "as3/main" with two windows,
+ * each running a plain "ssh -t as3" (no inner tmux). The user navigates
+ * windows and splits with their normal outer tmux keybindings.
  */
 static void
 remote_spawn_sessions(struct remote_host *rh)
 {
 	struct remote_session	*rs;
+	struct remote_window	*rw;
 	char			*sname, *cmd, *error, *ctrl_path;
+	char			*ssh_cmd;
 	struct cmdq_state	*state;
 	enum cmd_parse_status	 status;
+	int			 first;
 
 	ctrl_path = remote_control_path(rh);
+
+	/* Build the base SSH command that reuses the ControlMaster socket. */
+	xasprintf(&ssh_cmd,
+	    "ssh -o 'ControlPath=%s' -o ControlMaster=auto -t %s",
+	    ctrl_path, rh->ssh_target);
 
 	TAILQ_FOREACH(rs, &rh->sessions, entry) {
 		xasprintf(&sname, "%s/%s", rh->name, rs->name);
@@ -533,29 +538,71 @@ remote_spawn_sessions(struct remote_host *rh)
 			continue;
 		}
 
+		first = 1;
+		TAILQ_FOREACH(rw, &rs->windows, entry) {
+			if (first) {
+				/*
+				 * Create session with the first window.
+				 * Name the window after the remote window.
+				 */
+				xasprintf(&cmd,
+				    "new-session -d -s '%s' -n '%s' '%s'",
+				    sname, rw->name, ssh_cmd);
+				first = 0;
+			} else {
+				/*
+				 * Add subsequent windows to the session.
+				 */
+				xasprintf(&cmd,
+				    "new-window -d -t '%s:' -n '%s' '%s'",
+				    sname, rw->name, ssh_cmd);
+			}
+
+			state = cmdq_new_state(NULL, NULL, 0);
+			status = cmd_parse_and_append(cmd, NULL, NULL,
+			    state, &error);
+			if (status == CMD_PARSE_ERROR) {
+				log_debug("remote: %s: %s", sname, error);
+				free(error);
+			}
+			cmdq_free_state(state);
+			free(cmd);
+		}
+
+		if (first) {
+			/*
+			 * Session has no windows (shouldn't happen, but
+			 * create an empty one just in case).
+			 */
+			xasprintf(&cmd,
+			    "new-session -d -s '%s' '%s'",
+			    sname, ssh_cmd);
+			state = cmdq_new_state(NULL, NULL, 0);
+			cmd_parse_and_append(cmd, NULL, NULL, state, &error);
+			cmdq_free_state(state);
+			free(cmd);
+		}
+
 		/*
-		 * Queue a new-session command. The -d flag creates it
-		 * detached so it doesn't steal the client's focus.
+		 * Set session options:
+		 * - remain-on-exit: panes stay when SSH disconnects
+		 * - detach-on-destroy: switch to another session, don't detach
+		 * - default-command: prefix+c opens SSH to remote, not local shell
 		 */
 		xasprintf(&cmd,
-		    "new-session -d -s '%s' "
-		    "\"ssh -o 'ControlPath=%s' -o ControlMaster=auto "
-		    "-t %s tmux attach-session -t '%s'\"",
-		    sname, ctrl_path, rh->ssh_target, rs->name);
-
+		    "set-option -t '%s' remain-on-exit on \\; "
+		    "set-option -t '%s' detach-on-destroy no-detached \\; "
+		    "set-option -t '%s' default-command '%s'",
+		    sname, sname, sname, ssh_cmd);
 		state = cmdq_new_state(NULL, NULL, 0);
-		status = cmd_parse_and_append(cmd, NULL, NULL, state, &error);
-		if (status == CMD_PARSE_ERROR) {
-			log_debug("remote: %s: %s", sname, error);
-			free(error);
-		} else {
-			log_debug("remote: queued session %s", sname);
-		}
+		cmd_parse_and_append(cmd, NULL, NULL, state, &error);
 		cmdq_free_state(state);
-
 		free(cmd);
+
+		log_debug("remote: created session %s", sname);
 		free(sname);
 	}
+	free(ssh_cmd);
 	free(ctrl_path);
 }
 
