@@ -417,8 +417,26 @@ remote_parse_output(struct remote_host *rh, const char *line)
 
 	/* Find the local proxy pane for this remote pane. */
 	wp = remote_find_proxy_pane(rh, pane_id);
-	if (wp == NULL)
-		return;
+	if (wp == NULL) {
+		/*
+		 * No mapped pane — look for an unmapped proxy pane
+		 * (remote_pane == 0) and assign this remote pane to it.
+		 * This handles panes created by prefix+c where we don't
+		 * know the remote ID until output arrives.
+		 */
+		RB_FOREACH(wp, window_pane_tree, &all_window_panes) {
+			if ((wp->flags & PANE_REMOTE) &&
+			    wp->remote == rh &&
+			    wp->remote_pane == 0) {
+				wp->remote_pane = pane_id;
+				log_debug("remote: auto-mapped %%%u -> "
+				    "remote %%%u", wp->id, pane_id);
+				break;
+			}
+		}
+		if (wp == NULL)
+			return;
+	}
 
 	/* Decode octal escapes and inject into the pane's input parser. */
 	buf = xmalloc(strlen(data) + 1);
