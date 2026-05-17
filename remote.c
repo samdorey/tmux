@@ -220,15 +220,20 @@ remote_connect_control(struct remote_host *rh)
 
 	ctrl_path = remote_control_path(rh);
 
+	/*
+	 * Use attach-session so the control client is in the same session
+	 * as the user's panes. This is required because %output is only
+	 * sent for panes in the control client's attached session.
+	 */
 	if (rh->tmux_target != NULL)
 		xasprintf(&cmd,
 		    "ssh -o 'ControlPath=%s' -o ControlMaster=auto "
-		    "%s tmux -C new-session -A -t %s",
+		    "%s tmux -C attach-session -t %s",
 		    ctrl_path, rh->ssh_target, rh->tmux_target);
 	else
 		xasprintf(&cmd,
 		    "ssh -o 'ControlPath=%s' -o ControlMaster=auto "
-		    "%s tmux -C new-session -A",
+		    "%s tmux -C attach-session",
 		    ctrl_path, rh->ssh_target);
 
 	rh->job = job_run(cmd, 0, NULL, NULL, NULL, NULL,
