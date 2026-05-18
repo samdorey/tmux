@@ -380,7 +380,7 @@ remote_parse_line(struct remote_host *rh, const char *line)
 			if ((ewp->flags & PANE_REMOTE) &&
 			    ewp->remote == rh &&
 			    ewp->pid > 1)
-				kill(ewp->pid, SIGHUP);
+				kill(ewp->pid, SIGKILL);
 		}
 		rh->state = REMOTE_DISCONNECTED;
 		return;
@@ -412,7 +412,7 @@ remote_parse_line(struct remote_host *rh, const char *line)
 						    rh, rp->id);
 						if (cwp != NULL &&
 						    cwp->pid > 1) {
-							kill(cwp->pid, SIGHUP);
+							kill(cwp->pid, SIGKILL);
 							log_debug("remote: "
 							    "killed %%%u "
 							    "(window @%u "
@@ -675,9 +675,8 @@ remote_spawn_sessions(struct remote_host *rh)
 		 * Set session options.
 		 */
 		xasprintf(&cmd,
-		    "set-option -t '%s' remain-on-exit on \\; "
 		    "set-option -t '%s' detach-on-destroy no-detached",
-		    sname, sname);
+		    sname);
 		state = cmdq_new_state(NULL, NULL, 0);
 		cmd_parse_and_append(cmd, NULL, NULL, state, &error);
 		cmdq_free_state(state);
