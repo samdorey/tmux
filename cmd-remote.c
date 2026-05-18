@@ -114,9 +114,17 @@ cmd_remote_add_exec(struct cmd *self, struct cmdq_item *item)
 	if (ssh_target == NULL)
 		ssh_target = name;
 
-	if (remote_find(name) != NULL) {
-		cmdq_error(item, "remote already exists: %s", name);
-		return (CMD_RETURN_ERROR);
+	rh = remote_find(name);
+	if (rh != NULL) {
+		/* Already exists — reconnect if disconnected/failed. */
+		if (rh->state == REMOTE_READY ||
+		    rh->state == REMOTE_CONNECTING) {
+			cmdq_error(item, "remote already connected: %s", name);
+			return (CMD_RETURN_ERROR);
+		}
+		remote_connect(rh, item);
+		cmdq_print(item, "Reconnecting remote: %s", name);
+		return (CMD_RETURN_NORMAL);
 	}
 
 	rh = remote_add(name, ssh_target, tmux_target);
