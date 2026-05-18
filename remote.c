@@ -18,6 +18,7 @@
 
 #include <sys/types.h>
 
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -372,7 +373,57 @@ remote_parse_line(struct remote_host *rh, const char *line)
 		return;
 	}
 	if (strncmp(line, "%exit", 5) == 0) {
+		struct window_pane	*ewp;
+
+		/* Kill all proxy panes for this remote. */
+		RB_FOREACH(ewp, window_pane_tree, &all_window_panes) {
+			if ((ewp->flags & PANE_REMOTE) &&
+			    ewp->remote == rh &&
+			    ewp->pid > 1)
+				kill(ewp->pid, SIGHUP);
+		}
 		rh->state = REMOTE_DISCONNECTED;
+		return;
+	}
+
+	/*
+	 * Handle window close notifications. tmux sends:
+	 * - %unlinked-window-close @<id> when a window closes
+	 * - %window-close @<id> (older versions)
+	 * Kill local proxy panes for the closed window.
+	 */
+	if (strncmp(line, "%unlinked-window-close @", 24) == 0 ||
+	    strncmp(line, "%window-close @", 15) == 0) {
+		u_int			 closed_wid;
+		struct remote_session	*rs;
+		struct remote_window	*rw;
+		struct remote_pane	*rp;
+		struct window_pane	*cwp;
+		const char		*at;
+
+		at = strchr(line, '@');
+		if (at != NULL && sscanf(at, "@%u", &closed_wid) == 1) {
+			TAILQ_FOREACH(rs, &rh->sessions, entry) {
+				TAILQ_FOREACH(rw, &rs->windows, entry) {
+					if (rw->id != closed_wid)
+						continue;
+					TAILQ_FOREACH(rp, &rw->panes, entry) {
+						cwp = remote_find_proxy_pane(
+						    rh, rp->id);
+						if (cwp != NULL &&
+						    cwp->pid > 1) {
+							kill(cwp->pid, SIGHUP);
+							log_debug("remote: "
+							    "killed %%%u "
+							    "(window @%u "
+							    "closed)",
+							    cwp->id,
+							    closed_wid);
+						}
+					}
+				}
+			}
+		}
 		return;
 	}
 
