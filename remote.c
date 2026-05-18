@@ -646,12 +646,14 @@ remote_spawn_sessions(struct remote_host *rh)
 
 			if (first_win) {
 				xasprintf(&cmd,
-				    "new-session -d -s '%s' -n '%s' -x 80 -y 24",
+				    "new-session -d -s '%s' -n '%s' "
+				    "-x 80 -y 24 'exec cat > /dev/null'",
 				    sname, rw->name);
 				first_win = 0;
 			} else {
 				xasprintf(&cmd,
-				    "new-window -d -t '%s:' -n '%s'",
+				    "new-window -d -t '%s:' -n '%s' "
+				    "'exec cat > /dev/null'",
 				    sname, rw->name);
 			}
 
@@ -745,22 +747,16 @@ remote_mark_panes_cb(__unused struct cmdq_item *item, void *data)
 		}
 	}
 
-	/* Trigger initial screen content for all proxy panes. */
+	/*
+	 * Request a refresh so any pending %output from the remote
+	 * panes gets delivered. Don't use send-keys as it injects
+	 * spurious prompts.
+	 */
 	{
 		struct bufferevent *bev = job_get_event(rh->job);
 		if (bev != NULL) {
-			char cmd[64];
-			TAILQ_FOREACH(rs, &rh->sessions, entry) {
-				TAILQ_FOREACH(rw, &rs->windows, entry) {
-					rp = TAILQ_FIRST(&rw->panes);
-					if (rp == NULL)
-						continue;
-					snprintf(cmd, sizeof cmd,
-					    "send-keys -t %%%u ''\n", rp->id);
-					bufferevent_write(bev, cmd,
-					    strlen(cmd));
-				}
-			}
+			bufferevent_write(bev, "refresh-client\n",
+			    strlen("refresh-client\n"));
 		}
 	}
 
