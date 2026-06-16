@@ -2333,6 +2333,7 @@ struct spawn_context {
 #define SPAWN_FULLSIZE 0x20
 #define SPAWN_EMPTY 0x40
 #define SPAWN_ZOOM 0x80
+#define SPAWN_NOTREMOTE 0x100	/* force a local pane in a remote session */
 };
 
 /* Paste buffer. */

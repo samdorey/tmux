@@ -209,7 +209,12 @@ remote_connect(struct remote_host *rh, struct cmdq_item *item)
 	sc.name = wname;
 	sc.idx = -1;
 	sc.cwd = NULL;
-	sc.flags = 0;
+	/*
+	 * Force a real local pane: when the active session is itself a remote
+	 * proxy, the auth helper must run the ssh command locally, not become
+	 * another proxy pane.
+	 */
+	sc.flags = SPAWN_NOTREMOTE;
 
 	new_wl = spawn_window(&sc, &cause);
 	if (new_wl == NULL) {

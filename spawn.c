@@ -378,7 +378,7 @@ spawn_pane(struct spawn_context *sc, char **cause)
 	 * set up the pane as a remote proxy. All I/O will go through
 	 * the control mode connection instead of the child process.
 	 */
-	if (s->remote != NULL) {
+	if (s->remote != NULL && (~sc->flags & SPAWN_NOTREMOTE)) {
 		new_wp->pid = fdforkpty(ptm_fd, &new_wp->fd, new_wp->tty,
 		    NULL, &ws);
 		if (new_wp->pid == -1) {
