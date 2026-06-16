@@ -1401,6 +1401,12 @@ struct window {
 	u_int			 references;
 	TAILQ_HEAD(, winlink)	 winlinks;
 
+	/* Remote proxy window (NULL if local). */
+	struct remote_host	*remote;
+	u_int			 remote_window;		/* remote @id, or UINT_MAX */
+	u_int			 remote_sx;		/* last size sent to remote */
+	u_int			 remote_sy;
+
 	RB_ENTRY(window)	 entry;
 };
 RB_HEAD(windows, window);

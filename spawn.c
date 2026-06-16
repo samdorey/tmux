@@ -407,8 +407,20 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		log_debug("spawn: remote proxy pane %%%u for %s",
 		    new_wp->id, s->remote->name);
 
-		/* Tell the remote to create a new window. */
-		remote_create_window(s->remote, s->remote_session);
+		/*
+		 * If we are mirroring the remote tree (creating placeholder
+		 * panes to match a remote layout), do not ask the remote to
+		 * create anything -- the mapping is filled in afterwards.
+		 * Otherwise this is a user-initiated new window, so tag the
+		 * window and tell the remote to create it.
+		 */
+		if (!s->remote->mirroring) {
+			if (w->remote == NULL) {
+				w->remote = s->remote;
+				w->remote_window = UINT_MAX;
+			}
+			remote_create_window(s->remote, s->remote_session);
+		}
 
 		goto complete;
 	}

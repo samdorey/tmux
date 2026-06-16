@@ -44,6 +44,7 @@ struct remote_window {
 	int				 idx;
 	char				*name;
 	int				 active;
+	char				*layout;	/* #{window_layout} */
 	struct remote_panes		 panes;
 	TAILQ_ENTRY(remote_window)	 entry;
 };
@@ -67,19 +68,41 @@ enum remote_parse_state {
 	PARSE_PANES
 };
 
+struct remote_host;
+
+/*
+ * A single control-mode connection. There is one per attached remote
+ * session (control mode only streams %output for the session its client is
+ * attached to), all multiplexed over the host's shared SSH ControlMaster.
+ */
+struct remote_conn {
+	struct remote_host		*rh;
+	char				*session;	/* remote session streamed */
+	int				 primary;	/* drives tree discovery */
+
+	struct job			*job;
+	enum remote_state		 state;
+	enum remote_parse_state		 parse_state;
+
+	TAILQ_ENTRY(remote_conn)	 entry;
+};
+TAILQ_HEAD(remote_conns, remote_conn);
+
 /* A remote host definition. */
 struct remote_host {
 	char				*name;
 	char				*ssh_target;
 	char				*tmux_target;	/* optional -t arg */
 
-	enum remote_state		 state;
+	enum remote_state		 state;		/* mirrors primary conn */
 	char				*error;
 
-	struct job			*job;
-	struct evbuffer			*pending;	/* partial line buf */
-	enum remote_parse_state		 parse_state;
+	struct remote_conns		 conns;
 	struct remote_sessions		 sessions;
+
+	int				 mirroring;	/* suppress remote-side
+							   window creation while
+							   mirroring remote tree */
 
 	TAILQ_ENTRY(remote_host)	 entry;
 };
@@ -108,5 +131,8 @@ void			 remote_send_key(struct window_pane *, key_code,
 void			 remote_create_window(struct remote_host *,
 			     const char *);
 struct window_pane	*remote_find_proxy_pane(struct remote_host *, u_int);
+void			 remote_window_resize(struct window *, u_int, u_int);
+void			 remote_apply_layout(struct remote_host *, u_int,
+			     const char *, int);
 
 #endif /* REMOTE_H */

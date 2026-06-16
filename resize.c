@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "tmux.h"
+#include "remote.h"
 
 void
 resize_window(struct window *w, u_int sx, u_int sy, int xpixel, int ypixel)
@@ -396,6 +397,14 @@ recalculate_size(struct window *w, int now)
 		tty_update_window_offset(w);
 		return;
 	}
+
+	/*
+	 * For a remote proxy window, propagate the new size to the remote so
+	 * its panes are produced at the matching dimensions. The remote's
+	 * %layout-change reply re-syncs the local geometry.
+	 */
+	if (w->remote != NULL)
+		remote_window_resize(w, sx, sy);
 
 	/*
 	 * If the now flag is set or if the window is sized manually, change

@@ -30,7 +30,14 @@ struct remote_hosts remote_hosts = TAILQ_HEAD_INITIALIZER(remote_hosts);
 static void	remote_update_cb(struct job *);
 static void	remote_complete_cb(struct job *);
 static void	remote_free_cb(void *);
-static void	remote_parse_line(struct remote_host *, const char *);
+static void	remote_parse_line(struct remote_conn *, const char *);
+static struct remote_conn *remote_spawn_conn(struct remote_host *, const char *,
+		    int);
+static void	remote_conn_free(struct remote_conn *);
+static struct remote_conn *remote_find_conn(struct remote_host *, const char *);
+static struct bufferevent *remote_primary_bev(struct remote_host *);
+static void	remote_spawn_session_conns(struct remote_host *);
+static void	remote_kill_session_panes(struct remote_host *, const char *);
 static void	remote_parse_output(struct remote_host *, const char *);
 static void	remote_parse_sessions(struct remote_host *, const char *);
 static void	remote_parse_windows(struct remote_host *, const char *);
@@ -41,6 +48,18 @@ static size_t		remote_decode_output(const char *, u_char *, size_t);
 static enum cmd_retval	remote_mark_panes_cb(struct cmdq_item *, void *);
 static void		remote_set_session_remote(struct session *,
 			    struct remote_host *, const char *);
+static void		remote_queue_command(const char *);
+static u_int		remote_layout_pane_ids(const char *, u_int *, u_int);
+static enum cmd_retval	remote_apply_layout_cb(struct cmdq_item *, void *);
+
+/* Pending layout application, run as a queued callback. */
+struct remote_layout_apply {
+	struct remote_host	*rh;
+	u_int			 local_window;	/* local @id */
+	u_int			 ids[256];	/* remote pane ids, cell order */
+	u_int			 n;
+	int			 dec_mirroring;	/* undo rh->mirroring bump */
+};
 
 void
 remote_init(void)
@@ -69,7 +88,7 @@ remote_add(const char *name, const char *ssh_target, const char *tmux_target)
 		rh->tmux_target = xstrdup(tmux_target);
 	rh->state = REMOTE_DISCONNECTED;
 	TAILQ_INIT(&rh->sessions);
-	rh->pending = evbuffer_new();
+	TAILQ_INIT(&rh->conns);
 	TAILQ_INSERT_TAIL(&remote_hosts, rh, entry);
 	return (rh);
 }
@@ -81,7 +100,6 @@ remote_remove(struct remote_host *rh)
 	remote_destroy_sessions(rh);
 	remote_clear_tree(rh);
 	TAILQ_REMOVE(&remote_hosts, rh, entry);
-	evbuffer_free(rh->pending);
 	free(rh->name);
 	free(rh->ssh_target);
 	free(rh->tmux_target);
@@ -117,6 +135,7 @@ remote_clear_tree(struct remote_host *rh)
 			}
 			TAILQ_REMOVE(&rs->windows, rw, entry);
 			free(rw->name);
+			free(rw->layout);
 			free(rw);
 		}
 		TAILQ_REMOVE(&rh->sessions, rs, entry);
@@ -205,11 +224,112 @@ remote_connect(struct remote_host *rh, struct cmdq_item *item)
 	free(cmd);
 }
 
+/*
+ * Spawn one control-mode connection. If session is non-NULL it attaches to
+ * that specific session; if NULL (the primary with no configured target) it
+ * attaches to the remote's most-recent session, and its streamed session is
+ * resolved to the first discovered one later (see remote_spawn_sessions).
+ *
+ * attach-session never creates a session, so mounting a host no longer
+ * spawns a spurious "main". All connections share the host's SSH
+ * ControlMaster, so only the first pays for an SSH handshake.
+ */
+static struct remote_conn *
+remote_spawn_conn(struct remote_host *rh, const char *session, int primary)
+{
+	struct remote_conn	*rc;
+	char			*cmd, *ctrl_path;
+
+	rc = xcalloc(1, sizeof *rc);
+	rc->rh = rh;
+	rc->session = (session != NULL) ? xstrdup(session) : NULL;
+	rc->primary = primary;
+	rc->state = REMOTE_CONNECTING;
+	rc->parse_state = PARSE_IDLE;
+	TAILQ_INSERT_TAIL(&rh->conns, rc, entry);
+
+	ctrl_path = remote_control_path(rh);
+	if (session != NULL)
+		xasprintf(&cmd,
+		    "ssh -o 'ControlPath=%s' -o ControlMaster=auto "
+		    "%s tmux -C attach-session -t %s",
+		    ctrl_path, rh->ssh_target, session);
+	else
+		xasprintf(&cmd,
+		    "ssh -o 'ControlPath=%s' -o ControlMaster=auto "
+		    "%s tmux -C attach-session",
+		    ctrl_path, rh->ssh_target);
+
+	rc->job = job_run(cmd, 0, NULL, NULL, NULL, NULL,
+	    remote_update_cb, remote_complete_cb, remote_free_cb,
+	    rc, JOB_NOWAIT | JOB_KEEPWRITE, -1, -1);
+	free(cmd);
+	free(ctrl_path);
+	return (rc);
+}
+
+static void
+remote_conn_free(struct remote_conn *rc)
+{
+	/*
+	 * job_free() invokes remote_free_cb(), which removes rc from the list
+	 * and frees it. If the job already finished, free directly.
+	 */
+	if (rc->job != NULL)
+		job_free(rc->job);
+	else
+		remote_free_cb(rc);
+}
+
+/* Find the connection streaming a given remote session. */
+static struct remote_conn *
+remote_find_conn(struct remote_host *rh, const char *session)
+{
+	struct remote_conn	*rc;
+
+	TAILQ_FOREACH(rc, &rh->conns, entry) {
+		if (rc->session != NULL && strcmp(rc->session, session) == 0)
+			return (rc);
+	}
+	return (NULL);
+}
+
+/* The bufferevent of the primary connection, if ready (for sending cmds). */
+static struct bufferevent *
+remote_primary_bev(struct remote_host *rh)
+{
+	struct remote_conn	*rc;
+
+	TAILQ_FOREACH(rc, &rh->conns, entry) {
+		if (rc->primary && rc->state == REMOTE_READY && rc->job != NULL)
+			return (job_get_event(rc->job));
+	}
+	return (NULL);
+}
+
+/*
+ * Once the tree is known, ensure every remote session has a streaming
+ * connection. The primary already streams its own session; spawn one for
+ * each of the others. Streaming the same session twice would duplicate
+ * %output, so sessions already covered are skipped.
+ */
+static void
+remote_spawn_session_conns(struct remote_host *rh)
+{
+	struct remote_session	*rs;
+
+	TAILQ_FOREACH(rs, &rh->sessions, entry) {
+		if (remote_find_conn(rh, rs->name) != NULL)
+			continue;
+		log_debug("remote: streaming conn for %s/%s", rh->name,
+		    rs->name);
+		remote_spawn_conn(rh, rs->name, 0);
+	}
+}
+
 void
 remote_connect_control(struct remote_host *rh)
 {
-	char	*cmd, *ctrl_path;
-
 	if (rh->state == REMOTE_READY)
 		return;
 
@@ -219,58 +339,48 @@ remote_connect_control(struct remote_host *rh)
 		rh->state = REMOTE_CONNECTING;
 	}
 
-	ctrl_path = remote_control_path(rh);
-
 	/*
-	 * Use new-session -A -s <name> so the control client either attaches
-	 * to an existing session or creates one. This ensures %output flows
-	 * for that session's panes (control mode only sends %output for panes
-	 * in the attached session).
+	 * Primary connection: drives discovery and streams one session. With a
+	 * configured tmux-target it attaches there; otherwise it attaches to
+	 * the most-recent session and is retargeted to the first discovered
+	 * one once the tree is known.
 	 */
-	if (rh->tmux_target != NULL)
-		xasprintf(&cmd,
-		    "ssh -o 'ControlPath=%s' -o ControlMaster=auto "
-		    "%s tmux -C new-session -A -s %s",
-		    ctrl_path, rh->ssh_target, rh->tmux_target);
-	else
-		xasprintf(&cmd,
-		    "ssh -o 'ControlPath=%s' -o ControlMaster=auto "
-		    "%s tmux -C new-session -A -s main",
-		    ctrl_path, rh->ssh_target);
-
-	rh->job = job_run(cmd, 0, NULL, NULL, NULL, NULL,
-	    remote_update_cb, remote_complete_cb, remote_free_cb,
-	    rh, JOB_NOWAIT | JOB_KEEPWRITE, -1, -1);
-	free(cmd);
-	free(ctrl_path);
+	remote_spawn_conn(rh, rh->tmux_target, 1);
 }
 
 void
 remote_disconnect(struct remote_host *rh)
 {
-	if (rh->job != NULL) {
-		job_free(rh->job);
-		rh->job = NULL;
-	}
+	struct remote_conn	*rc, *rc1;
+
+	TAILQ_FOREACH_SAFE(rc, &rh->conns, entry, rc1)
+		remote_conn_free(rc);
 	rh->state = REMOTE_DISCONNECTED;
-	evbuffer_drain(rh->pending, evbuffer_get_length(rh->pending));
 }
 
 void
 remote_refresh(struct remote_host *rh)
 {
+	struct remote_conn	*rc = NULL, *loop;
 	struct bufferevent	*bev;
 
-	if (rh->state != REMOTE_READY || rh->job == NULL)
+	/* Discovery runs on the primary connection. */
+	TAILQ_FOREACH(loop, &rh->conns, entry) {
+		if (loop->primary) {
+			rc = loop;
+			break;
+		}
+	}
+	if (rc == NULL || rc->state != REMOTE_READY || rc->job == NULL)
 		return;
 
-	bev = job_get_event(rh->job);
+	bev = job_get_event(rc->job);
 	if (bev == NULL)
 		return;
 
 	remote_destroy_sessions(rh);
 	remote_clear_tree(rh);
-	rh->parse_state = PARSE_SESSIONS;
+	rc->parse_state = PARSE_SESSIONS;
 
 	bufferevent_write(bev, "list-sessions -F "
 	    "'#{session_id}:#{session_name}:#{session_attached}'\n",
@@ -278,10 +388,10 @@ remote_refresh(struct remote_host *rh)
 	    "'#{session_id}:#{session_name}:#{session_attached}'\n"));
 	bufferevent_write(bev, "list-windows -a -F "
 	    "'#{session_id}:#{window_id}:#{window_index}:"
-	    "#{window_name}:#{window_active}'\n",
+	    "#{window_active}:#{window_layout}:#{window_name}'\n",
 	    strlen("list-windows -a -F "
 	    "'#{session_id}:#{window_id}:#{window_index}:"
-	    "#{window_name}:#{window_active}'\n"));
+	    "#{window_active}:#{window_layout}:#{window_name}'\n"));
 	bufferevent_write(bev, "list-panes -a -F "
 	    "'#{window_id}:#{pane_id}:#{pane_title}:#{pane_active}'\n",
 	    strlen("list-panes -a -F "
@@ -291,7 +401,7 @@ remote_refresh(struct remote_host *rh)
 static void
 remote_update_cb(struct job *job)
 {
-	struct remote_host	*rh = job_get_data(job);
+	struct remote_conn	*rc = job_get_data(job);
 	struct bufferevent	*bev = job_get_event(job);
 	struct evbuffer		*buf;
 	char			*line;
@@ -301,7 +411,7 @@ remote_update_cb(struct job *job)
 	buf = bufferevent_get_input(bev);
 
 	while ((line = evbuffer_readln(buf, NULL, EVBUFFER_EOL_LF)) != NULL) {
-		remote_parse_line(rh, line);
+		remote_parse_line(rc, line);
 		free(line);
 	}
 }
@@ -309,22 +419,58 @@ remote_update_cb(struct job *job)
 static void
 remote_complete_cb(struct job *job)
 {
-	struct remote_host	*rh = job_get_data(job);
+	struct remote_conn	*rc = job_get_data(job);
+	struct remote_host	*rh = rc->rh;
 	int			 status = job_get_status(job);
 
-	rh->job = NULL;
-	if (status != 0) {
-		rh->state = REMOTE_FAILED;
-		free(rh->error);
-		xasprintf(&rh->error, "ssh exited with status %d", status);
-	} else {
-		rh->state = REMOTE_DISCONNECTED;
+	rc->job = NULL;
+	rc->state = (status != 0) ? REMOTE_FAILED : REMOTE_DISCONNECTED;
+
+	/* The primary connection's state is the host's state. */
+	if (rc->primary) {
+		if (status != 0) {
+			rh->state = REMOTE_FAILED;
+			free(rh->error);
+			xasprintf(&rh->error, "ssh exited with status %d",
+			    status);
+		} else
+			rh->state = REMOTE_DISCONNECTED;
 	}
+
+	/* rc itself is freed by remote_free_cb, invoked next by job_free(). */
 }
 
 static void
-remote_free_cb(void *data __attribute__((unused)))
+remote_free_cb(void *data)
 {
+	struct remote_conn	*rc = data;
+
+	TAILQ_REMOVE(&rc->rh->conns, rc, entry);
+	free(rc->session);
+	free(rc);
+}
+
+/* Kill the placeholder processes of a remote session's local proxy panes. */
+static void
+remote_kill_session_panes(struct remote_host *rh, const char *session)
+{
+	struct session		*s;
+	struct winlink		*wl;
+	struct window_pane	*wp;
+	char			*sname;
+
+	xasprintf(&sname, "%s/%s", rh->name, session);
+	s = session_find(sname);
+	free(sname);
+	if (s == NULL)
+		return;
+
+	RB_FOREACH(wl, winlinks, &s->windows) {
+		TAILQ_FOREACH(wp, &wl->window->panes, entry) {
+			if ((wp->flags & PANE_REMOTE) && wp->pid > 1)
+				kill(wp->pid, SIGKILL);
+		}
+	}
 }
 
 /*
@@ -332,8 +478,10 @@ remote_free_cb(void *data __attribute__((unused)))
  * %begin/%end for command responses, and ignore other notifications.
  */
 static void
-remote_parse_line(struct remote_host *rh, const char *line)
+remote_parse_line(struct remote_conn *rc, const char *line)
 {
+	struct remote_host	*rh = rc->rh;
+
 	/* Handle %output — real-time pane output for proxy panes. */
 	if (strncmp(line, "%output ", 8) == 0) {
 		remote_parse_output(rh, line + 8);
@@ -344,24 +492,32 @@ remote_parse_line(struct remote_host *rh, const char *line)
 		return;
 
 	if (strncmp(line, "%end ", 5) == 0) {
-		if (rh->state == REMOTE_CONNECTING) {
-			rh->state = REMOTE_READY;
-			remote_clear_tree(rh);
-			rh->parse_state = PARSE_IDLE;
-			remote_refresh(rh);
+		if (rc->state == REMOTE_CONNECTING) {
+			rc->state = REMOTE_READY;
+			rc->parse_state = PARSE_IDLE;
+			/*
+			 * Only the primary connection discovers and builds the
+			 * tree; secondary connections just stream their
+			 * session's %output.
+			 */
+			if (rc->primary) {
+				rh->state = REMOTE_READY;
+				remote_clear_tree(rh);
+				remote_refresh(rh);
+			}
 			return;
 		}
-		switch (rh->parse_state) {
+		switch (rc->parse_state) {
 		case PARSE_IDLE:
 			break;
 		case PARSE_SESSIONS:
-			rh->parse_state = PARSE_WINDOWS;
+			rc->parse_state = PARSE_WINDOWS;
 			break;
 		case PARSE_WINDOWS:
-			rh->parse_state = PARSE_PANES;
+			rc->parse_state = PARSE_PANES;
 			break;
 		case PARSE_PANES:
-			rh->parse_state = PARSE_IDLE;
+			rc->parse_state = PARSE_IDLE;
 			remote_spawn_sessions(rh);
 			break;
 		}
@@ -369,20 +525,19 @@ remote_parse_line(struct remote_host *rh, const char *line)
 	}
 
 	if (strncmp(line, "%error ", 7) == 0) {
-		rh->parse_state = PARSE_IDLE;
+		rc->parse_state = PARSE_IDLE;
 		return;
 	}
 	if (strncmp(line, "%exit", 5) == 0) {
-		struct window_pane	*ewp;
-
-		/* Kill all proxy panes for this remote. */
-		RB_FOREACH(ewp, window_pane_tree, &all_window_panes) {
-			if ((ewp->flags & PANE_REMOTE) &&
-			    ewp->remote == rh &&
-			    ewp->pid > 1)
-				kill(ewp->pid, SIGKILL);
-		}
-		rh->state = REMOTE_DISCONNECTED;
+		/*
+		 * The session this connection streams has ended. Kill its
+		 * proxy panes; the host is only marked down if the primary
+		 * connection exits.
+		 */
+		if (rc->session != NULL)
+			remote_kill_session_panes(rh, rc->session);
+		if (rc->primary)
+			rh->state = REMOTE_DISCONNECTED;
 		return;
 	}
 
@@ -427,12 +582,27 @@ remote_parse_line(struct remote_host *rh, const char *line)
 		return;
 	}
 
+	/*
+	 * Layout change: the remote relayed a window's new geometry (a
+	 * resize, split, or pane close). Replicate it locally.
+	 * Format: %layout-change @<id> <layout> <visible-layout> <flags>
+	 */
+	if (strncmp(line, "%layout-change @", 16) == 0) {
+		u_int	wid;
+		char	layout[2048];
+
+		if (sscanf(line, "%%layout-change @%u %2047s", &wid,
+		    layout) == 2)
+			remote_apply_layout(rh, wid, layout, 1);
+		return;
+	}
+
 	/* Ignore other %-prefixed notifications. */
 	if (line[0] == '%')
 		return;
 
 	/* Data line — parse based on current state. */
-	switch (rh->parse_state) {
+	switch (rc->parse_state) {
 	case PARSE_IDLE:
 		break;
 	case PARSE_SESSIONS:
@@ -548,17 +718,18 @@ remote_parse_sessions(struct remote_host *rh, const char *line)
 	TAILQ_INSERT_TAIL(&rh->sessions, rs, entry);
 }
 
-/* Parse: $session_id:@window_id:index:name:active */
+/* Parse: $session_id:@window_id:index:active:layout:name */
 static void
 remote_parse_windows(struct remote_host *rh, const char *line)
 {
 	struct remote_session	*rs;
 	struct remote_window	*rw;
 	u_int			 sid, wid, idx, active;
+	char			 layout[2048];
 	char			 name[256];
 
-	if (sscanf(line, "$%u:@%u:%u:%255[^:]:%u",
-	    &sid, &wid, &idx, name, &active) != 5)
+	if (sscanf(line, "$%u:@%u:%u:%u:%2047[^:]:%255[^\n]",
+	    &sid, &wid, &idx, &active, layout, name) != 6)
 		return;
 
 	TAILQ_FOREACH(rs, &rh->sessions, entry) {
@@ -573,6 +744,7 @@ remote_parse_windows(struct remote_host *rh, const char *line)
 	rw->idx = idx;
 	rw->name = xstrdup(name);
 	rw->active = active;
+	rw->layout = xstrdup(layout);
 	TAILQ_INIT(&rw->panes);
 	TAILQ_INSERT_TAIL(&rs->windows, rw, entry);
 }
@@ -607,6 +779,197 @@ found:
 	TAILQ_INSERT_TAIL(&rw->panes, rp, entry);
 }
 
+/* Parse and append a tmux command to the global command queue. */
+static void
+remote_queue_command(const char *cmd)
+{
+	struct cmdq_state	*state;
+	char			*error;
+
+	state = cmdq_new_state(NULL, NULL, 0);
+	if (cmd_parse_and_append(cmd, NULL, NULL, state, &error) ==
+	    CMD_PARSE_ERROR) {
+		log_debug("remote: queue '%s': %s", cmd, error);
+		free(error);
+	}
+	cmdq_free_state(state);
+}
+
+/*
+ * Extract leaf pane IDs from a window_layout string in layout-tree (cell)
+ * order -- the same order layout_parse()/layout_assign() use to assign the
+ * window's panes to cells. A leaf cell is "SXxSY,XOFF,YOFF,PANEID"; an
+ * internal cell is "SXxSY,XOFF,YOFF" followed by '{' or '['. Returns the
+ * number of leaves found (capped at max).
+ */
+static u_int
+remote_layout_pane_ids(const char *layout, u_int *ids, u_int max)
+{
+	const char	*cp;
+	u_int		 n = 0;
+	u_int		 sx, sy, xoff, yoff, pid;
+	int		 consumed;
+
+	/* Skip the "csum," checksum prefix. */
+	cp = strchr(layout, ',');
+	if (cp == NULL)
+		return (0);
+	cp++;
+
+	while (*cp != '\0') {
+		if (sscanf(cp, "%ux%u,%u,%u%n", &sx, &sy, &xoff, &yoff,
+		    &consumed) == 4) {
+			cp += consumed;
+			if (*cp == ',') {
+				/* Leaf cell: a pane id follows. */
+				cp++;
+				if (sscanf(cp, "%u%n", &pid, &consumed) == 1) {
+					if (n < max)
+						ids[n] = pid;
+					n++;
+					cp += consumed;
+				}
+			}
+			/* Otherwise an internal cell; '{' or '[' follows. */
+		} else
+			cp++;
+	}
+	return (n);
+}
+
+/*
+ * Reconcile a local proxy window with a remote window_layout: adjust the
+ * local pane count to match, replicate the geometry, and remap each local
+ * pane to its remote pane id. Count changes (kill-pane/split-window) and
+ * the select-layout are queued so they run in order; the remap then runs
+ * as a trailing callback once those have completed.
+ *
+ * If allow_spawn is zero, the pane count is left as-is (used for resizes,
+ * where only the geometry changes).
+ */
+void
+remote_apply_layout(struct remote_host *rh, u_int wid, const char *layout,
+    int allow_spawn)
+{
+	struct window			*w = NULL, *wsearch;
+	struct window_pane		*wp, *wp1;
+	struct remote_layout_apply	*rla;
+	struct cmdq_item		*item;
+	u_int				 ids[256];
+	u_int				 n, cur, kept, removed, i;
+	char				*cmd;
+	int				 found;
+
+	if (layout == NULL || *layout == '\0')
+		return;
+
+	/* Find the local proxy window mapped to this remote window. */
+	RB_FOREACH(wsearch, windows, &windows) {
+		if (wsearch->remote == rh && wsearch->remote_window == wid) {
+			w = wsearch;
+			break;
+		}
+	}
+	if (w == NULL)
+		return;
+
+	n = remote_layout_pane_ids(layout, ids, nitems(ids));
+	if (n == 0)
+		return;
+
+	rla = xcalloc(1, sizeof *rla);
+	rla->rh = rh;
+	rla->local_window = w->id;
+	rla->n = n;
+	memcpy(rla->ids, ids, n * sizeof ids[0]);
+
+	cur = window_count_panes(w);
+	if (cur != n && allow_spawn) {
+		/*
+		 * Bump mirroring so the split-window calls below create proxy
+		 * placeholders without telling the remote to create windows.
+		 * The trailing callback drops it again.
+		 */
+		rh->mirroring++;
+		rla->dec_mirroring = 1;
+
+		/* Kill local panes whose remote id is gone from the layout. */
+		removed = 0;
+		TAILQ_FOREACH_SAFE(wp, &w->panes, entry, wp1) {
+			found = 0;
+			for (i = 0; i < n; i++) {
+				if (wp->remote_pane == ids[i]) {
+					found = 1;
+					break;
+				}
+			}
+			if (!found) {
+				xasprintf(&cmd, "kill-pane -t %%%u", wp->id);
+				remote_queue_command(cmd);
+				free(cmd);
+				removed++;
+			}
+		}
+
+		/* Split in placeholders until the count matches. */
+		kept = cur - removed;
+		for (i = kept; i < n; i++) {
+			xasprintf(&cmd, "split-window -d -t @%u "
+			    "'exec cat > /dev/null'", w->id);
+			remote_queue_command(cmd);
+			free(cmd);
+		}
+	}
+
+	/* Replicate the exact geometry. */
+	xasprintf(&cmd, "select-layout -t @%u '%s'", w->id, layout);
+	remote_queue_command(cmd);
+	free(cmd);
+
+	/* Remap local panes to remote ids once the above have run. */
+	item = cmdq_get_callback(remote_apply_layout_cb, rla);
+	cmdq_append(NULL, item);
+}
+
+/*
+ * Trailing callback for remote_apply_layout: walk the window's panes in
+ * order and assign each the remote pane id of the matching layout cell.
+ */
+static enum cmd_retval
+remote_apply_layout_cb(__unused struct cmdq_item *item, void *data)
+{
+	struct remote_layout_apply	*rla = data;
+	struct window			*w, *wsearch;
+	struct window_pane		*wp;
+	u_int				 i = 0;
+
+	w = NULL;
+	RB_FOREACH(wsearch, windows, &windows) {
+		if (wsearch->id == rla->local_window) {
+			w = wsearch;
+			break;
+		}
+	}
+	if (w != NULL) {
+		TAILQ_FOREACH(wp, &w->panes, entry) {
+			if (i >= rla->n)
+				break;
+			wp->flags |= PANE_REMOTE;
+			wp->remote = rla->rh;
+			wp->remote_pane = rla->ids[i];
+			log_debug("remote: mapped %%%u -> remote %%%u",
+			    wp->id, rla->ids[i]);
+			i++;
+		}
+	}
+
+	if (rla->dec_mirroring && rla->rh->mirroring > 0)
+		rla->rh->mirroring--;
+	free(rla);
+
+	return (CMD_RETURN_NORMAL);
+}
+
 /*
  * Create local sessions mirroring the remote tree.
  *
@@ -624,11 +987,39 @@ remote_spawn_sessions(struct remote_host *rh)
 {
 	struct remote_session	*rs;
 	struct remote_window	*rw;
-	struct remote_pane	*rp;
-	char			*sname, *cmd, *error;
-	struct cmdq_state	*state;
-	enum cmd_parse_status	 status;
+	struct remote_conn	*pc, *loop;
+	char			*sname, *cmd;
+	u_int			 ids[256], npanes, i;
 	int			 first_win;
+
+	/*
+	 * If the primary attached with no specific target, it landed on the
+	 * remote's most-recent session. Pin it to the first discovered session
+	 * (deterministic) so we know which session it streams and don't open a
+	 * duplicate streaming connection for it.
+	 */
+	pc = NULL;
+	TAILQ_FOREACH(loop, &rh->conns, entry) {
+		if (loop->primary) {
+			pc = loop;
+			break;
+		}
+	}
+	if (pc != NULL && pc->session == NULL) {
+		rs = TAILQ_FIRST(&rh->sessions);
+		if (rs != NULL) {
+			pc->session = xstrdup(rs->name);
+			if (pc->job != NULL) {
+				struct bufferevent *bev = job_get_event(pc->job);
+				if (bev != NULL) {
+					xasprintf(&cmd,
+					    "switch-client -t '%s'\n", rs->name);
+					bufferevent_write(bev, cmd, strlen(cmd));
+					free(cmd);
+				}
+			}
+		}
+	}
 
 	TAILQ_FOREACH(rs, &rh->sessions, entry) {
 		xasprintf(&sname, "%s/%s", rh->name, rs->name);
@@ -640,9 +1031,17 @@ remote_spawn_sessions(struct remote_host *rh)
 
 		first_win = 1;
 		TAILQ_FOREACH(rw, &rs->windows, entry) {
-			rp = TAILQ_FIRST(&rw->panes);
-			if (rp == NULL)
-				continue;
+			/*
+			 * Number of panes the window needs, taken from the
+			 * remote layout (authoritative); fall back to one.
+			 * The session is not yet marked remote, so these
+			 * commands create plain placeholder panes without
+			 * touching the remote.
+			 */
+			npanes = remote_layout_pane_ids(rw->layout, ids,
+			    nitems(ids));
+			if (npanes == 0)
+				npanes = 1;
 
 			if (first_win) {
 				xasprintf(&cmd,
@@ -651,21 +1050,23 @@ remote_spawn_sessions(struct remote_host *rh)
 				    sname, rw->name);
 				first_win = 0;
 			} else {
+				/* No -d: select it so the splits below hit it. */
 				xasprintf(&cmd,
-				    "new-window -d -t '%s:' -n '%s' "
+				    "new-window -t '%s:' -n '%s' "
 				    "'exec cat > /dev/null'",
 				    sname, rw->name);
 			}
-
-			state = cmdq_new_state(NULL, NULL, 0);
-			status = cmd_parse_and_append(cmd, NULL, NULL,
-			    state, &error);
-			if (status == CMD_PARSE_ERROR) {
-				log_debug("remote: %s: %s", sname, error);
-				free(error);
-			}
-			cmdq_free_state(state);
+			remote_queue_command(cmd);
 			free(cmd);
+
+			/* Split in the remaining panes for this window. */
+			for (i = 1; i < npanes; i++) {
+				xasprintf(&cmd,
+				    "split-window -t '%s' "
+				    "'exec cat > /dev/null'", sname);
+				remote_queue_command(cmd);
+				free(cmd);
+			}
 		}
 
 		if (first_win) {
@@ -679,9 +1080,7 @@ remote_spawn_sessions(struct remote_host *rh)
 		xasprintf(&cmd,
 		    "set-option -t '%s' detach-on-destroy no-detached",
 		    sname);
-		state = cmdq_new_state(NULL, NULL, 0);
-		cmd_parse_and_append(cmd, NULL, NULL, state, &error);
-		cmdq_free_state(state);
+		remote_queue_command(cmd);
 		free(cmd);
 
 		log_debug("remote: queued session %s", sname);
@@ -707,7 +1106,6 @@ remote_mark_panes_cb(__unused struct cmdq_item *item, void *data)
 	struct remote_host	*rh = data;
 	struct remote_session	*rs;
 	struct remote_window	*rw;
-	struct remote_pane	*rp;
 	struct session		*s;
 	struct winlink		*wl;
 	struct window_pane	*wp;
@@ -724,25 +1122,29 @@ remote_mark_panes_cb(__unused struct cmdq_item *item, void *data)
 		remote_set_session_remote(s, rh, rs->name);
 
 		/*
-		 * Retroactively mark existing panes as PANE_REMOTE.
-		 * Match remote windows to local windows in order.
+		 * Match remote windows to local windows in order. Mark the
+		 * window and all its panes as remote (mapping pane ids comes
+		 * from applying the layout below), then replicate the remote
+		 * geometry and refine the pane->remote-id mapping.
 		 */
 		wl = RB_MIN(winlinks, &s->windows);
 		TAILQ_FOREACH(rw, &rs->windows, entry) {
-			rp = TAILQ_FIRST(&rw->panes);
-			if (rp == NULL)
-				continue;
 			if (wl == NULL)
 				break;
 
-			wp = wl->window->active;
-			if (wp != NULL) {
+			wl->window->remote = rh;
+			wl->window->remote_window = rw->id;
+			wl->window->remote_sx = wl->window->sx;
+			wl->window->remote_sy = wl->window->sy;
+
+			TAILQ_FOREACH(wp, &wl->window->panes, entry) {
 				wp->flags |= PANE_REMOTE;
 				wp->remote = rh;
-				wp->remote_pane = rp->id;
-				log_debug("remote: marked %%%u -> remote %%%u",
-				    wp->id, rp->id);
+				wp->remote_pane = UINT_MAX;
 			}
+
+			remote_apply_layout(rh, rw->id, rw->layout, 0);
+
 			wl = RB_NEXT(winlinks, &s->windows, wl);
 		}
 	}
@@ -753,12 +1155,18 @@ remote_mark_panes_cb(__unused struct cmdq_item *item, void *data)
 	 * spurious prompts.
 	 */
 	{
-		struct bufferevent *bev = job_get_event(rh->job);
+		struct bufferevent *bev = remote_primary_bev(rh);
 		if (bev != NULL) {
 			bufferevent_write(bev, "refresh-client\n",
 			    strlen("refresh-client\n"));
 		}
 	}
+
+	/*
+	 * The tree and proxy panes are now in place; bring up a streaming
+	 * connection for every remote session so all of them deliver output.
+	 */
+	remote_spawn_session_conns(rh);
 
 	return (CMD_RETURN_NORMAL);
 }
@@ -822,13 +1230,19 @@ remote_find_proxy_pane(struct remote_host *rh, u_int remote_pane_id)
 void
 remote_create_window(struct remote_host *rh, const char *remote_session)
 {
+	struct remote_conn	*rc;
 	struct bufferevent	*bev;
 	char			 cmd[256];
 
-	if (rh->state != REMOTE_READY || rh->job == NULL)
+	if (rh->state != REMOTE_READY)
 		return;
 
-	bev = job_get_event(rh->job);
+	/* Prefer the connection attached to that session; else the primary. */
+	rc = remote_find_conn(rh, remote_session);
+	if (rc != NULL && rc->state == REMOTE_READY && rc->job != NULL)
+		bev = job_get_event(rc->job);
+	else
+		bev = remote_primary_bev(rh);
 	if (bev == NULL)
 		return;
 
@@ -838,52 +1252,148 @@ remote_create_window(struct remote_host *rh, const char *remote_session)
 }
 
 /*
- * Send a keystroke to a remote pane via the control mode connection.
+ * A local proxy window changed size. Tell the remote control client to
+ * adopt that size; the remote then relayouts and sends back a
+ * %layout-change which we replicate, keeping panes 1:1. Deduped on the
+ * last size sent to avoid oscillation.
  */
 void
-remote_send_key(struct window_pane *wp, key_code key,
-    __unused struct mouse_event *m)
+remote_window_resize(struct window *w, u_int sx, u_int sy)
+{
+	struct remote_host	*rh = w->remote;
+	struct remote_conn	*rc;
+	struct session		*s, *sloop;
+	struct bufferevent	*bev = NULL;
+	char			 cmd[64];
+
+	if (rh == NULL || rh->state != REMOTE_READY)
+		return;
+	if (sx == 0 || sy == 0)
+		return;
+	if (w->remote_sx == sx && w->remote_sy == sy)
+		return;
+	w->remote_sx = sx;
+	w->remote_sy = sy;
+
+	/*
+	 * refresh-client -C sets the *sending* client's size, so it must go
+	 * out on the connection attached to this window's session. Find that
+	 * session, then its connection.
+	 */
+	s = NULL;
+	RB_FOREACH(sloop, sessions, &sessions) {
+		if (sloop->remote == rh &&
+		    winlink_find_by_window(&sloop->windows, w) != NULL) {
+			s = sloop;
+			break;
+		}
+	}
+	if (s != NULL && s->remote_session != NULL) {
+		rc = remote_find_conn(rh, s->remote_session);
+		if (rc != NULL && rc->state == REMOTE_READY && rc->job != NULL)
+			bev = job_get_event(rc->job);
+	}
+	if (bev == NULL)
+		return;
+
+	snprintf(cmd, sizeof cmd, "refresh-client -C %ux%u\n", sx, sy);
+	bufferevent_write(bev, cmd, strlen(cmd));
+	log_debug("remote: resize %s @%u -> %ux%u", rh->name,
+	    w->remote_window, sx, sy);
+}
+
+/*
+ * Send raw bytes to a remote pane as a hex send-keys command. This bypasses
+ * the remote tmux's own key handling and is used for content that is already
+ * an exact terminal byte sequence: UTF-8 text and mouse reports.
+ */
+static void
+remote_send_bytes(struct remote_host *rh, u_int pane, const u_char *buf,
+    size_t len)
+{
+	struct bufferevent	*bev;
+	char			*cmd, *p;
+	size_t			 i, size, off;
+
+	if (len == 0)
+		return;
+	bev = remote_primary_bev(rh);
+	if (bev == NULL)
+		return;
+
+	size = 32 + len * 3 + 2;
+	cmd = xmalloc(size);
+	off = xsnprintf(cmd, size, "send-keys -t %%%u -H", pane);
+	p = cmd + off;
+	for (i = 0; i < len; i++)
+		p += xsnprintf(p, size - (p - cmd), " %02x", buf[i]);
+	*p++ = '\n';
+	*p = '\0';
+
+	bufferevent_write(bev, cmd, strlen(cmd));
+	free(cmd);
+}
+
+/*
+ * Send a keystroke or mouse event to a remote pane via the control mode
+ * connection. Plain text (ASCII and UTF-8) and mouse events are sent as raw
+ * bytes; other keys (control, modified, function) are sent by name so the
+ * remote tmux encodes them according to the remote application's modes.
+ */
+void
+remote_send_key(struct window_pane *wp, key_code key, struct mouse_event *m)
 {
 	struct remote_host	*rh = wp->remote;
 	struct bufferevent	*bev;
-	const char		*keystr;
+	struct screen		*s = wp->screen;
+	struct utf8_data	 ud;
+	const char		*keystr, *buf;
 	char			 cmd[512];
+	size_t			 len;
+	u_int			 x, y;
 	u_char			 ch;
 
-	if (rh == NULL || rh->job == NULL || rh->state != REMOTE_READY)
+	if (rh == NULL || rh->state != REMOTE_READY)
 		return;
 	if (wp->remote_pane == UINT_MAX)
 		return; /* not mapped yet */
 
-	bev = job_get_event(rh->job);
+	bev = remote_primary_bev(rh);
 	if (bev == NULL)
 		return;
 
-	/* Ignore mouse events for now. */
-	if (KEYC_IS_MOUSE(key))
-		return;
-
 	/*
-	 * For simple ASCII characters, send them as literal text which is
-	 * more reliable than key names for things like quotes, semicolons.
+	 * Mouse: encode with the local mirrored screen mode (which tracks the
+	 * remote application's mouse mode via %output) and send raw.
 	 */
-	if (key < 0x80 && key >= 0x20) {
-		ch = (u_char)key;
-		/* Escape single quotes for the shell. */
-		if (ch == '\'')
-			snprintf(cmd, sizeof cmd,
-			    "send-keys -t %%%u -l \"'\"\n", wp->remote_pane);
-		else if (ch == '\\')
-			snprintf(cmd, sizeof cmd,
-			    "send-keys -t %%%u -l '\\\\'\n", wp->remote_pane);
-		else
-			snprintf(cmd, sizeof cmd,
-			    "send-keys -t %%%u -l '%c'\n", wp->remote_pane, ch);
-		bufferevent_write(bev, cmd, strlen(cmd));
+	if (KEYC_IS_MOUSE(key)) {
+		if (m == NULL || m->ignore)
+			return;
+		if ((s->mode & ALL_MOUSE_MODES) == 0)
+			return;
+		if (cmd_mouse_at(wp, m, &x, &y, 0) != 0)
+			return;
+		if (!input_key_get_mouse(s, m, x, y, &buf, &len))
+			return;
+		remote_send_bytes(rh, wp->remote_pane, (const u_char *)buf, len);
 		return;
 	}
 
-	/* For control characters (Ctrl+C, Enter, etc.), use key names. */
+	/* Plain key (no modifiers): send its literal bytes. */
+	if (!(key & ~KEYC_MASK_KEY)) {
+		if (key >= 0x20 && key <= 0x7f) {
+			ch = (u_char)key;
+			remote_send_bytes(rh, wp->remote_pane, &ch, 1);
+			return;
+		}
+		if (KEYC_IS_UNICODE(key)) {
+			utf8_to_data(key, &ud);
+			remote_send_bytes(rh, wp->remote_pane, ud.data, ud.size);
+			return;
+		}
+	}
+
+	/* Control, modified, and function keys: send by name. */
 	keystr = key_string_lookup_key(key, 0);
 	if (keystr == NULL || *keystr == '\0')
 		return;
