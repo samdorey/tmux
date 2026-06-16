@@ -420,7 +420,19 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		if (!s->remote->mirroring) {
 			if (w->remote == s->remote &&
 			    w->remote_window != UINT_MAX) {
-				remote_split_window(s->remote, w->remote_window);
+				u_int	src = UINT_MAX;
+				int	horiz = 0;
+
+				/* Source pane to split on the remote. */
+				if (sc->wp0 != NULL)
+					src = sc->wp0->remote_pane;
+				/* Direction from the new pane's split node. */
+				if (sc->lc != NULL && sc->lc->parent != NULL &&
+				    sc->lc->parent->type == LAYOUT_LEFTRIGHT)
+					horiz = 1;
+
+				remote_split_window(s->remote, w->remote_window,
+				    src, horiz);
 			} else {
 				w->remote = s->remote;
 				w->remote_window = UINT_MAX;

@@ -1300,14 +1300,17 @@ remote_create_window(struct remote_host *rh, const char *remote_session,
 
 /*
  * Split an existing remote window. Called from spawn_pane() when the user
- * splits a local proxy window: the new pane belongs to the same remote
- * window, so the remote splits it and the resulting %layout-change maps the
- * new local pane into place.
+ * splits a local proxy pane: split the same source pane on the remote, in
+ * the same direction (horizontal == left/right), so the resulting
+ * %layout-change reproduces the layout the user asked for. If the source
+ * pane is not mapped yet, fall back to splitting the window.
  */
 void
-remote_split_window(struct remote_host *rh, u_int remote_window)
+remote_split_window(struct remote_host *rh, u_int remote_window,
+    u_int remote_pane, int horizontal)
 {
 	struct bufferevent	*bev;
+	const char		*dir = horizontal ? "-h" : "-v";
 	char			 cmd[256];
 
 	if (rh->state != REMOTE_READY)
@@ -1316,9 +1319,15 @@ remote_split_window(struct remote_host *rh, u_int remote_window)
 	if (bev == NULL)
 		return;
 
-	snprintf(cmd, sizeof cmd, "split-window -t @%u\n", remote_window);
+	if (remote_pane != UINT_MAX)
+		snprintf(cmd, sizeof cmd, "split-window %s -t %%%u\n",
+		    dir, remote_pane);
+	else
+		snprintf(cmd, sizeof cmd, "split-window %s -t @%u\n",
+		    dir, remote_window);
 	bufferevent_write(bev, cmd, strlen(cmd));
-	log_debug("remote: split remote @%u", remote_window);
+	log_debug("remote: split remote %s @%u/%%%u", dir, remote_window,
+	    remote_pane);
 }
 
 /*
