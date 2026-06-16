@@ -251,6 +251,11 @@ remote_spawn_conn(struct remote_host *rh, const char *session, int primary)
 	TAILQ_INSERT_TAIL(&rh->conns, rc, entry);
 
 	ctrl_path = remote_control_path(rh);
+	/*
+	 * ControlPersist keeps the shared SSH master alive independently of any
+	 * single connection, so killing one session's connection (e.g. the
+	 * primary's) does not tear down the others multiplexed over it.
+	 */
 	if (session == NULL)
 		/*
 		 * Primary, no target: attach to the most-recent session, or
@@ -258,14 +263,16 @@ remote_spawn_conn(struct remote_host *rh, const char *session, int primary)
 		 * can still be mounted).
 		 */
 		xasprintf(&cmd,
-		    "ssh -o 'ControlPath=%s' -o ControlMaster=auto %s "
+		    "ssh -o 'ControlPath=%s' -o ControlMaster=auto "
+		    "-o ControlPersist=60 %s "
 		    "'tmux -C attach-session 2>/dev/null || "
 		    "tmux -C new-session'",
 		    ctrl_path, rh->ssh_target);
 	else if (primary)
 		/* Primary with an explicit target: attach, or create it. */
 		xasprintf(&cmd,
-		    "ssh -o 'ControlPath=%s' -o ControlMaster=auto %s "
+		    "ssh -o 'ControlPath=%s' -o ControlMaster=auto "
+		    "-o ControlPersist=60 %s "
 		    "'tmux -C attach-session -t %s 2>/dev/null || "
 		    "tmux -C new-session -s %s'",
 		    ctrl_path, rh->ssh_target, session, session);
@@ -273,7 +280,7 @@ remote_spawn_conn(struct remote_host *rh, const char *session, int primary)
 		/* Secondary: attach to an already-discovered session. */
 		xasprintf(&cmd,
 		    "ssh -o 'ControlPath=%s' -o ControlMaster=auto "
-		    "%s tmux -C attach-session -t %s",
+		    "-o ControlPersist=60 %s tmux -C attach-session -t %s",
 		    ctrl_path, rh->ssh_target, session);
 
 	rc->job = job_run(cmd, 0, NULL, NULL, NULL, NULL,
