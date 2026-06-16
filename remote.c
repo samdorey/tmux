@@ -392,14 +392,15 @@ remote_refresh(struct remote_host *rh)
 	struct remote_conn	*rc = NULL, *loop;
 	struct bufferevent	*bev;
 
-	/* Discovery runs on the primary connection. */
+	/* Discovery runs on the primary connection (must be ready). */
 	TAILQ_FOREACH(loop, &rh->conns, entry) {
-		if (loop->primary) {
+		if (loop->primary && loop->state == REMOTE_READY &&
+		    loop->job != NULL) {
 			rc = loop;
 			break;
 		}
 	}
-	if (rc == NULL || rc->state != REMOTE_READY || rc->job == NULL)
+	if (rc == NULL)
 		return;
 
 	bev = job_get_event(rc->job);
@@ -454,9 +455,27 @@ remote_complete_cb(struct job *job)
 	rc->job = NULL;
 	rc->state = (status != 0) ? REMOTE_FAILED : REMOTE_DISCONNECTED;
 
-	/* The primary connection's state is the host's state. */
+	/*
+	 * The primary connection drives discovery and carries outgoing commands
+	 * (input, new-window, refresh). If it dies but other sessions are still
+	 * mounted, promote a surviving connection to primary so the host stays
+	 * usable; only mark the host down when nothing is left.
+	 */
 	if (rc->primary) {
-		if (status != 0) {
+		struct remote_conn	*loop, *heir = NULL;
+
+		TAILQ_FOREACH(loop, &rh->conns, entry) {
+			if (loop != rc && loop->state == REMOTE_READY &&
+			    loop->job != NULL) {
+				heir = loop;
+				break;
+			}
+		}
+		if (heir != NULL) {
+			heir->primary = 1;
+			rh->state = REMOTE_READY;
+			log_debug("remote: promoted %s to primary", heir->session);
+		} else if (status != 0) {
 			rh->state = REMOTE_FAILED;
 			free(rh->error);
 			xasprintf(&rh->error, "ssh exited with status %d",
