@@ -83,5 +83,4 @@ Linux remote running tmux `3.5a`.
 ---
 
 This is a fork of tmux. For tmux itself — full build dependencies, the manual,
-and upstream documentation — see the original [`README`](README) and
-<https://github.com/tmux/tmux>.
+and upstream documentation — see upstream at <https://github.com/tmux/tmux>.
