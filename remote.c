@@ -38,6 +38,7 @@ static struct remote_conn *remote_find_conn(struct remote_host *, const char *);
 static struct bufferevent *remote_primary_bev(struct remote_host *);
 static void	remote_spawn_session_conns(struct remote_host *);
 static void	remote_kill_session_panes(struct remote_host *, const char *);
+static void	remote_close_window(struct remote_host *, u_int);
 static void	remote_parse_output(struct remote_host *, const char *);
 static void	remote_parse_sessions(struct remote_host *, const char *);
 static void	remote_parse_windows(struct remote_host *, const char *);
@@ -87,6 +88,7 @@ remote_add(const char *name, const char *ssh_target, const char *tmux_target)
 	if (tmux_target != NULL)
 		rh->tmux_target = xstrdup(tmux_target);
 	rh->state = REMOTE_DISCONNECTED;
+	rh->pending_window = UINT_MAX;
 	TAILQ_INIT(&rh->sessions);
 	TAILQ_INIT(&rh->conns);
 	TAILQ_INSERT_TAIL(&remote_hosts, rh, entry);
@@ -474,6 +476,28 @@ remote_kill_session_panes(struct remote_host *rh, const char *session)
 }
 
 /*
+ * A remote window closed; close the local proxy window mapped to it by
+ * killing its placeholder panes (the window goes away once they exit).
+ */
+static void
+remote_close_window(struct remote_host *rh, u_int remote_window)
+{
+	struct window		*w;
+	struct window_pane	*wp;
+
+	RB_FOREACH(w, windows, &windows) {
+		if (w->remote != rh || w->remote_window != remote_window)
+			continue;
+		TAILQ_FOREACH(wp, &w->panes, entry) {
+			if ((wp->flags & PANE_REMOTE) && wp->pid > 1)
+				kill(wp->pid, SIGKILL);
+		}
+		log_debug("remote: closing local @%u (remote @%u closed)",
+		    w->id, remote_window);
+	}
+}
+
+/*
  * Parse control mode output. Handle %output for proxy pane I/O,
  * %begin/%end for command responses, and ignore other notifications.
  */
@@ -542,43 +566,48 @@ remote_parse_line(struct remote_conn *rc, const char *line)
 	}
 
 	/*
+	 * A window was added to a session we stream. If we are waiting to map
+	 * a window we just created locally (prefix+c), bind it now so close
+	 * and layout notifications can find it.
+	 */
+	if (strncmp(line, "%window-add @", 13) == 0) {
+		u_int		 wid;
+		struct window	*w, *wsearch;
+
+		if (rh->pending_window != UINT_MAX &&
+		    sscanf(line, "%%window-add @%u", &wid) == 1) {
+			w = NULL;
+			RB_FOREACH(wsearch, windows, &windows) {
+				if (wsearch->id == rh->pending_window) {
+					w = wsearch;
+					break;
+				}
+			}
+			if (w != NULL) {
+				w->remote = rh;
+				w->remote_window = wid;
+				log_debug("remote: bound local @%u -> remote @%u",
+				    w->id, wid);
+			}
+			rh->pending_window = UINT_MAX;
+		}
+		return;
+	}
+
+	/*
 	 * Handle window close notifications. tmux sends:
 	 * - %unlinked-window-close @<id> when a window closes
 	 * - %window-close @<id> (older versions)
-	 * Kill local proxy panes for the closed window.
+	 * Close the local proxy window mapped to it.
 	 */
 	if (strncmp(line, "%unlinked-window-close @", 24) == 0 ||
 	    strncmp(line, "%window-close @", 15) == 0) {
-		u_int			 closed_wid;
-		struct remote_session	*rs;
-		struct remote_window	*rw;
-		struct remote_pane	*rp;
-		struct window_pane	*cwp;
-		const char		*at;
+		u_int		 closed_wid;
+		const char	*at;
 
 		at = strchr(line, '@');
-		if (at != NULL && sscanf(at, "@%u", &closed_wid) == 1) {
-			TAILQ_FOREACH(rs, &rh->sessions, entry) {
-				TAILQ_FOREACH(rw, &rs->windows, entry) {
-					if (rw->id != closed_wid)
-						continue;
-					TAILQ_FOREACH(rp, &rw->panes, entry) {
-						cwp = remote_find_proxy_pane(
-						    rh, rp->id);
-						if (cwp != NULL &&
-						    cwp->pid > 1) {
-							kill(cwp->pid, SIGKILL);
-							log_debug("remote: "
-							    "killed %%%u "
-							    "(window @%u "
-							    "closed)",
-							    cwp->id,
-							    closed_wid);
-						}
-					}
-				}
-			}
-		}
+		if (at != NULL && sscanf(at, "@%u", &closed_wid) == 1)
+			remote_close_window(rh, closed_wid);
 		return;
 	}
 
@@ -1224,11 +1253,14 @@ remote_find_proxy_pane(struct remote_host *rh, u_int remote_pane_id)
 }
 
 /*
- * Create a new window on the remote tmux via control mode.
- * Called from spawn_pane() when a new pane is created in a remote session.
+ * Create a new window on the remote tmux via control mode. Called from
+ * spawn_pane() for a user-initiated new window (prefix+c). local_window is
+ * the id of the local proxy window just created; it is recorded so the
+ * matching %window-add can bind the two (for layout and close handling).
  */
 void
-remote_create_window(struct remote_host *rh, const char *remote_session)
+remote_create_window(struct remote_host *rh, const char *remote_session,
+    u_int local_window)
 {
 	struct remote_conn	*rc;
 	struct bufferevent	*bev;
@@ -1246,9 +1278,33 @@ remote_create_window(struct remote_host *rh, const char *remote_session)
 	if (bev == NULL)
 		return;
 
+	rh->pending_window = local_window;
 	snprintf(cmd, sizeof cmd, "new-window -t '%s'\n", remote_session);
 	bufferevent_write(bev, cmd, strlen(cmd));
 	log_debug("remote: created window on %s/%s", rh->name, remote_session);
+}
+
+/*
+ * Split an existing remote window. Called from spawn_pane() when the user
+ * splits a local proxy window: the new pane belongs to the same remote
+ * window, so the remote splits it and the resulting %layout-change maps the
+ * new local pane into place.
+ */
+void
+remote_split_window(struct remote_host *rh, u_int remote_window)
+{
+	struct bufferevent	*bev;
+	char			 cmd[256];
+
+	if (rh->state != REMOTE_READY)
+		return;
+	bev = remote_primary_bev(rh);
+	if (bev == NULL)
+		return;
+
+	snprintf(cmd, sizeof cmd, "split-window -t @%u\n", remote_window);
+	bufferevent_write(bev, cmd, strlen(cmd));
+	log_debug("remote: split remote @%u", remote_window);
 }
 
 /*

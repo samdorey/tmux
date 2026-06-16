@@ -411,15 +411,22 @@ spawn_pane(struct spawn_context *sc, char **cause)
 		 * If we are mirroring the remote tree (creating placeholder
 		 * panes to match a remote layout), do not ask the remote to
 		 * create anything -- the mapping is filled in afterwards.
-		 * Otherwise this is a user-initiated new window, so tag the
-		 * window and tell the remote to create it.
+		 *
+		 * Otherwise this is user-initiated: a split of an already
+		 * mapped window splits the same window on the remote; a brand
+		 * new window (prefix+c) creates a remote window, to be bound
+		 * to this local window when its %window-add arrives.
 		 */
 		if (!s->remote->mirroring) {
-			if (w->remote == NULL) {
+			if (w->remote == s->remote &&
+			    w->remote_window != UINT_MAX) {
+				remote_split_window(s->remote, w->remote_window);
+			} else {
 				w->remote = s->remote;
 				w->remote_window = UINT_MAX;
+				remote_create_window(s->remote,
+				    s->remote_session, w->id);
 			}
-			remote_create_window(s->remote, s->remote_session);
 		}
 
 		goto complete;

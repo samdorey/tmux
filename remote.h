@@ -103,6 +103,9 @@ struct remote_host {
 	int				 mirroring;	/* suppress remote-side
 							   window creation while
 							   mirroring remote tree */
+	u_int				 pending_window;/* local @id awaiting a
+							   %window-add mapping,
+							   or UINT_MAX */
 
 	TAILQ_ENTRY(remote_host)	 entry;
 };
@@ -129,7 +132,8 @@ char			*remote_control_path(struct remote_host *);
 void			 remote_send_key(struct window_pane *, key_code,
 			     struct mouse_event *);
 void			 remote_create_window(struct remote_host *,
-			     const char *);
+			     const char *, u_int);
+void			 remote_split_window(struct remote_host *, u_int);
 struct window_pane	*remote_find_proxy_pane(struct remote_host *, u_int);
 void			 remote_window_resize(struct window *, u_int, u_int);
 void			 remote_apply_layout(struct remote_host *, u_int,
