@@ -1337,6 +1337,7 @@ struct window_pane {
 	struct style	 scrollbar_style;
 
 	/* Remote proxy pane fields (PANE_REMOTE). */
+	struct evbuffer	*remote_paste;	/* pasted content being buffered */
 	struct remote_host *remote;	/* owning remote host */
 	u_int		 remote_pane;	/* remote pane ID (%<id>) */
 

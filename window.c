@@ -1047,6 +1047,8 @@ window_pane_destroy(struct window_pane *wp)
 	RB_REMOVE(window_pane_tree, &all_window_panes, wp);
 
 	options_free(wp->options);
+	if (wp->remote_paste != NULL)
+		evbuffer_free(wp->remote_paste);
 	free((void *)wp->cwd);
 	free(wp->shell);
 	cmd_free_argv(wp->argc, wp->argv);
@@ -1261,6 +1263,18 @@ window_pane_paste(struct window_pane *wp, key_code key, char *buf, size_t len)
 
 	if (wp->fd == -1 || wp->flags & PANE_INPUTOFF)
 		return;
+
+	/*
+	 * Remote proxy pane: route pasted content to the remote instead of
+	 * the local placeholder process. The paste marker keys themselves are
+	 * handled in remote_send_key(); their raw bytes must not be added to
+	 * the content.
+	 */
+	if (wp->flags & PANE_REMOTE) {
+		if (!KEYC_IS_PASTE(key))
+			remote_paste_input(wp, buf, len);
+		return;
+	}
 
 	if (KEYC_IS_PASTE(key) && (~wp->screen->mode & MODE_BRACKETPASTE))
 		return;

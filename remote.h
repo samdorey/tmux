@@ -131,6 +131,8 @@ void			 remote_open(struct remote_host *, const char *,
 char			*remote_control_path(struct remote_host *);
 void			 remote_send_key(struct window_pane *, key_code,
 			     struct mouse_event *);
+void			 remote_paste_input(struct window_pane *, const char *,
+			     size_t);
 void			 remote_create_window(struct remote_host *,
 			     const char *, u_int);
 void			 remote_split_window(struct remote_host *, u_int,

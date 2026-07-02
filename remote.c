@@ -39,6 +39,7 @@ static struct bufferevent *remote_primary_bev(struct remote_host *);
 static void	remote_spawn_session_conns(struct remote_host *);
 static void	remote_kill_session_panes(struct remote_host *, const char *);
 static void	remote_close_window(struct remote_host *, u_int);
+static void	remote_flush_paste(struct window_pane *);
 static void	remote_parse_output(struct remote_host *, const char *);
 static void	remote_parse_sessions(struct remote_host *, const char *);
 static void	remote_parse_windows(struct remote_host *, const char *);
@@ -1445,6 +1446,85 @@ remote_send_bytes(struct remote_host *rh, u_int pane, const u_char *buf,
 }
 
 /*
+ * Deliver buffered pasted content to the remote pane as one block. The
+ * content is octal-escaped through printf %b into the remote's load-buffer,
+ * then paste-buffer -p pastes it with bracket markers if (and only if) the
+ * remote application has requested bracketed paste. Escaped bytes only ever
+ * contain [\\0-9], so the command needs no further quoting; the printf
+ * argument is chunked to stay well under the OS per-argument limit.
+ */
+#define REMOTE_PASTE_MAX  (256 * 1024)	/* bytes of pasted content */
+#define REMOTE_PASTE_CHUNK 16000	/* source bytes per printf argument */
+
+static void
+remote_flush_paste(struct window_pane *wp)
+{
+	struct remote_host	*rh = wp->remote;
+	struct bufferevent	*bev;
+	struct evbuffer		*cmd;
+	u_char			*data;
+	size_t			 len, i;
+
+	if (wp->remote_paste == NULL)
+		return;
+	data = EVBUFFER_DATA(wp->remote_paste);
+	len = EVBUFFER_LENGTH(wp->remote_paste);
+
+	if (len == 0 || len > REMOTE_PASTE_MAX ||
+	    rh == NULL || rh->state != REMOTE_READY ||
+	    wp->remote_pane == UINT_MAX ||
+	    (bev = remote_primary_bev(rh)) == NULL) {
+		if (len > REMOTE_PASTE_MAX)
+			log_debug("remote: paste too large (%zu), dropped", len);
+		evbuffer_free(wp->remote_paste);
+		wp->remote_paste = NULL;
+		return;
+	}
+
+	cmd = evbuffer_new();
+	evbuffer_add_printf(cmd, "run-shell 'printf %%b");
+	for (i = 0; i < len; i++) {
+		if (i % REMOTE_PASTE_CHUNK == 0)
+			evbuffer_add(cmd, " ", 1);
+		evbuffer_add_printf(cmd, "\\\\0%03o", data[i]);
+	}
+	evbuffer_add_printf(cmd,
+	    " | tmux load-buffer -b __rmpaste_%u - && "
+	    "tmux paste-buffer -p -d -b __rmpaste_%u -t %%%u'\n",
+	    wp->remote_pane, wp->remote_pane, wp->remote_pane);
+
+	bufferevent_write(bev, EVBUFFER_DATA(cmd), EVBUFFER_LENGTH(cmd));
+	log_debug("remote: pasted %zu bytes to %%%u", len, wp->remote_pane);
+
+	evbuffer_free(cmd);
+	evbuffer_free(wp->remote_paste);
+	wp->remote_paste = NULL;
+}
+
+/*
+ * Pasted content for a proxy pane, raw bytes from window_pane_paste().
+ * Between bracketed paste markers it is accumulated and flushed as one
+ * block on PasteEnd (see remote_send_key). Outside the markers (e.g. the
+ * assume-paste-time heuristic) there is no end marker, so send the bytes
+ * straight through as if typed.
+ */
+void
+remote_paste_input(struct window_pane *wp, const char *buf, size_t len)
+{
+	struct remote_host	*rh = wp->remote;
+
+	if (rh == NULL || rh->state != REMOTE_READY ||
+	    wp->remote_pane == UINT_MAX)
+		return;
+
+	if (wp->remote_paste != NULL) {
+		evbuffer_add(wp->remote_paste, buf, len);
+		return;
+	}
+	remote_send_bytes(rh, wp->remote_pane, (const u_char *)buf, len);
+}
+
+/*
  * Send a keystroke or mouse event to a remote pane via the control mode
  * connection. Plain text (ASCII and UTF-8) and mouse events are sent as raw
  * bytes; other keys (control, modified, function) are sent by name so the
@@ -1486,6 +1566,26 @@ remote_send_key(struct window_pane *wp, key_code key, struct mouse_event *m)
 		if (!input_key_get_mouse(s, m, x, y, &buf, &len))
 			return;
 		remote_send_bytes(rh, wp->remote_pane, (const u_char *)buf, len);
+		return;
+	}
+
+	/*
+	 * Bracketed paste. Buffer the pasted content locally and hand the
+	 * whole block to the remote's own paste machinery (load-buffer +
+	 * paste-buffer -p), which bracket-wraps it if and only if the remote
+	 * application has requested paste mode -- the authoritative check.
+	 * (Forwarding the markers as named keys types the literal words on
+	 * remotes that don't know them, e.g. tmux 3.5a, and the local mirror
+	 * of the mode is unreliable when mounting an already-running app.)
+	 */
+	if ((key & KEYC_MASK_KEY) == KEYC_PASTE_START) {
+		if (wp->remote_paste == NULL)
+			wp->remote_paste = evbuffer_new();
+		return;
+	}
+	if ((key & KEYC_MASK_KEY) == KEYC_PASTE_END) {
+		if (wp->remote_paste != NULL)
+			remote_flush_paste(wp);
 		return;
 	}
 
