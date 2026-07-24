@@ -1445,7 +1445,12 @@ remote_create_window(struct remote_host *rh, const char *remote_session,
 		return;
 
 	rh->pending_window = local_window;
-	snprintf(cmd, sizeof cmd, "new-window -t '%s'\n", remote_session);
+	/*
+	 * The trailing colon forces target-session interpretation: a bare
+	 * numeric session name (tmux's default names: 0, 1, ...) would
+	 * otherwise parse as a window index in the current session.
+	 */
+	snprintf(cmd, sizeof cmd, "new-window -t '%s:'\n", remote_session);
 	bufferevent_write(bev, cmd, strlen(cmd));
 	log_debug("remote: created window on %s/%s", rh->name, remote_session);
 }
