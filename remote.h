@@ -84,6 +84,14 @@ struct remote_conn {
 	enum remote_state		 state;
 	enum remote_parse_state		 parse_state;
 
+	/* In-progress pane seed (capture-pane replay), see remote_seed_pane. */
+	int				 cap_active;
+	int				 cap_await;	/* sentinel block still open */
+	int				 cap_first;
+	u_int				 cap_pane;
+	u_int				 cap_x;
+	u_int				 cap_y;
+
 	TAILQ_ENTRY(remote_conn)	 entry;
 };
 TAILQ_HEAD(remote_conns, remote_conn);

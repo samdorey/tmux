@@ -40,6 +40,7 @@ static void	remote_spawn_session_conns(struct remote_host *);
 static void	remote_kill_session_panes(struct remote_host *, const char *);
 static void	remote_close_window(struct remote_host *, u_int);
 static void	remote_flush_paste(struct window_pane *);
+static void	remote_seed_pane(struct remote_host *, struct window_pane *);
 static void	remote_parse_output(struct remote_host *, const char *);
 static void	remote_parse_sessions(struct remote_host *, const char *);
 static void	remote_parse_windows(struct remote_host *, const char *);
@@ -498,6 +499,41 @@ remote_free_cb(void *data)
 	free(rc);
 }
 
+/*
+ * Ask the remote for a pane's current screen so a freshly mounted proxy is
+ * not blank until the application next redraws (apps with damage-tracking
+ * renderers may never repaint unprompted). The reply arrives as a normal
+ * %begin/%end block; a REMOTECAP sentinel line carries the pane id, cursor
+ * position and mouse modes, followed by the escaped screen lines, which are
+ * replayed into the proxy pane by remote_parse_line().
+ */
+static void
+remote_seed_pane(struct remote_host *rh, struct window_pane *wp)
+{
+	struct bufferevent	*bev;
+	char			 cmd[256];
+
+	if (wp->flags & PANE_REMOTESEEDED)
+		return;
+	wp->flags |= PANE_REMOTESEEDED;
+
+	if (wp->remote_pane == UINT_MAX)
+		return;
+	bev = remote_primary_bev(rh);
+	if (bev == NULL)
+		return;
+
+	snprintf(cmd, sizeof cmd,
+	    "display-message -p -t %%%u 'REMOTECAP %u "
+	    "#{cursor_x} #{cursor_y} #{mouse_standard_flag} "
+	    "#{mouse_button_flag} #{mouse_all_flag} #{mouse_sgr_flag}' ; "
+	    "capture-pane -peq -t %%%u\n",
+	    wp->remote_pane, wp->remote_pane, wp->remote_pane);
+	bufferevent_write(bev, cmd, strlen(cmd));
+	log_debug("remote: seeding %%%u from remote %%%u", wp->id,
+	    wp->remote_pane);
+}
+
 /* Kill the placeholder processes of a remote session's local proxy panes. */
 static void
 remote_kill_session_panes(struct remote_host *rh, const char *session)
@@ -560,6 +596,35 @@ remote_parse_line(struct remote_conn *rc, const char *line)
 
 	if (strncmp(line, "%begin ", 7) == 0)
 		return;
+
+	if (strncmp(line, "%end ", 5) == 0 || strncmp(line, "%error ", 7) == 0) {
+		if (rc->cap_active) {
+			struct window_pane	*cwp;
+			char			 cup[32];
+
+			/*
+			 * The sentinel and the capture output arrive as two
+			 * separate %begin/%end blocks; the first %end merely
+			 * closes the sentinel's block.
+			 */
+			if (rc->cap_await) {
+				rc->cap_await = 0;
+				return;
+			}
+
+			/* Pane seed complete: restore the cursor position. */
+			cwp = remote_find_proxy_pane(rh, rc->cap_pane);
+			if (cwp != NULL) {
+				snprintf(cup, sizeof cup, "\033[%u;%uH",
+				    rc->cap_y + 1, rc->cap_x + 1);
+				input_parse_buffer(cwp, (u_char *)cup,
+				    strlen(cup));
+				cwp->flags |= PANE_CHANGED;
+			}
+			rc->cap_active = 0;
+			return;
+		}
+	}
 
 	if (strncmp(line, "%end ", 5) == 0) {
 		if (rc->state == REMOTE_CONNECTING) {
@@ -676,6 +741,56 @@ remote_parse_line(struct remote_conn *rc, const char *line)
 	if (line[0] == '%')
 		return;
 
+	/* Screen content being replayed into a freshly seeded pane. */
+	if (rc->cap_active) {
+		struct window_pane	*cwp;
+
+		cwp = remote_find_proxy_pane(rh, rc->cap_pane);
+		if (cwp != NULL) {
+			if (!rc->cap_first)
+				input_parse_buffer(cwp, (u_char *)"\r\n", 2);
+			input_parse_buffer(cwp, (u_char *)line, strlen(line));
+			cwp->flags |= PANE_CHANGED;
+		}
+		rc->cap_first = 0;
+		return;
+	}
+
+	/* Start of a pane seed reply (see remote_seed_pane). */
+	if (strncmp(line, "REMOTECAP ", 10) == 0) {
+		struct window_pane	*cwp;
+		u_int			 pane, x, y, ms, mb, ma, mg;
+
+		if (sscanf(line, "REMOTECAP %u %u %u %u %u %u %u",
+		    &pane, &x, &y, &ms, &mb, &ma, &mg) != 7)
+			return;
+		rc->cap_active = 1;
+		rc->cap_await = 1;
+		rc->cap_first = 1;
+		rc->cap_pane = pane;
+		rc->cap_x = x;
+		rc->cap_y = y;
+
+		cwp = remote_find_proxy_pane(rh, pane);
+		if (cwp != NULL) {
+			/* Clear, then re-establish the pane's mouse modes. */
+			input_parse_buffer(cwp, (u_char *)"\033[H\033[J", 6);
+			if (ms)
+				input_parse_buffer(cwp,
+				    (u_char *)"\033[?1000h", 8);
+			if (mb)
+				input_parse_buffer(cwp,
+				    (u_char *)"\033[?1002h", 8);
+			if (ma)
+				input_parse_buffer(cwp,
+				    (u_char *)"\033[?1003h", 8);
+			if (mg)
+				input_parse_buffer(cwp,
+				    (u_char *)"\033[?1006h", 8);
+		}
+		return;
+	}
+
 	/* Data line — parse based on current state. */
 	switch (rc->parse_state) {
 	case PARSE_IDLE:
@@ -731,6 +846,8 @@ remote_parse_output(struct remote_host *rh, const char *line)
 			    wp->remote == rh &&
 			    wp->remote_pane == UINT_MAX) {
 				wp->remote_pane = pane_id;
+				/* Output is already flowing; no seed needed. */
+				wp->flags |= PANE_REMOTESEEDED;
 				log_debug("remote: auto-mapped %%%u -> "
 				    "remote %%%u", wp->id, pane_id);
 				break;
@@ -1035,6 +1152,9 @@ remote_apply_layout_cb(__unused struct cmdq_item *item, void *data)
 			log_debug("remote: mapped %%%u -> remote %%%u",
 			    wp->id, rla->ids[i]);
 			i++;
+
+			/* Replay current content into the new proxy. */
+			remote_seed_pane(rla->rh, wp);
 		}
 	}
 

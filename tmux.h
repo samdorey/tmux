@@ -1280,6 +1280,7 @@ struct window_pane {
 #define PANE_UNSEENCHANGES 0x4000
 #define PANE_REDRAWSCROLLBAR 0x8000
 #define PANE_REMOTE 0x10000
+#define PANE_REMOTESEEDED 0x20000	/* initial content replayed */
 
 	u_int		 sb_slider_y;
 	u_int		 sb_slider_h;
